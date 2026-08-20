@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -9,13 +10,16 @@ import discord
 
 
 # ============================================================
-# NOIR 新規開拓プロフィール表示Bot
+# 新サーバー プロフィール表示Bot
 #
 # ・VC生成はしない
-# ・既存パネルも触らない
-# ・指定カテゴリー内のVC入室だけ監視
-# ・VCのインチャへプロフィールを自動表示
-# ・「プロフィールを見る」で本人のプロフィール投稿へジャンプ
+# ・指定カテゴリー内のVCのみ監視
+# ・VCのインチャへプロフィール表示
+# ・プロフィールを見るボタン
+# ・ID / メンション / 表示名検索対応
+# ・同じ人のプロフィールは1部屋1枚
+# ・退出したら本人のプロフィールカードだけ削除
+# ・再入室したら再表示
 # ============================================================
 
 
@@ -23,21 +27,33 @@ TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 
 
 # ============================================================
-# NOIR 設定
+# サーバー設定
 # ============================================================
 
-GUILD_ID = 1482224471606820874
+GUILD_ID = 1539443579871821965
 
-# 新規開拓VCが生成されるカテゴリー
-NEW_MEMBER_CATEGORY_ID = 1521453832788246690
 
+# ============================================================
+# プロフィール表示対象VCカテゴリー
+# ============================================================
+
+PROFILE_VOICE_CATEGORY_ID = 1539455562016882728
+
+
+# ============================================================
 # プロフィールチャンネル
-MALE_PROFILE_CHANNEL_ID = 1482301104258547863
-FEMALE_PROFILE_CHANNEL_ID = 1482301192263569522
+# ============================================================
 
+MALE_PROFILE_CHANNEL_ID = 1539453475891454063
+FEMALE_PROFILE_CHANNEL_ID = 1539453537174683759
+
+
+# ============================================================
 # 性別ロール
-MALE_ROLE_ID = 1482301549353897984
-FEMALE_ROLE_ID = 1523690396515962981
+# ============================================================
+
+MALE_ROLE_ID = 1539454501059301426
+FEMALE_ROLE_ID = 1539454571477475348
 
 
 # ============================================================
@@ -46,10 +62,6 @@ FEMALE_ROLE_ID = 1523690396515962981
 
 # プロフィール検索で遡る最大件数
 PROFILE_SCAN_LIMIT = 3000
-
-# 同じVCで同じ人のプロフィールを
-# 何度も表示しない
-POST_ONCE_PER_ROOM = True
 
 
 # ============================================================
@@ -62,7 +74,7 @@ logging.basicConfig(
 )
 
 log = logging.getLogger(
-    "noir-profile-bot"
+    "profile-bot"
 )
 
 
@@ -74,9 +86,6 @@ intents = discord.Intents.default()
 
 intents.guilds = True
 intents.voice_states = True
-
-# プロフィール投稿の本文やEmbedから
-# ユーザーIDを探すために使用
 intents.message_content = True
 
 
@@ -96,8 +105,17 @@ client = discord.Client(
 # user_id -> profile jump URL
 profile_cache: dict[int, str] = {}
 
-# (voice_channel_id, user_id)
-posted_in_room: set[tuple[int, int]] = set()
+# (voice_channel_id, user_id) -> 投稿したプロフィールカードのmessage_id
+posted_messages: dict[
+    tuple[int, int],
+    int
+] = {}
+
+# 同一ユーザーの同時処理防止
+profile_locks: dict[
+    int,
+    asyncio.Lock
+] = {}
 
 
 # ============================================================
@@ -107,10 +125,6 @@ posted_in_room: set[tuple[int, int]] = set()
 async def get_channel_safe(
     channel_id: int,
 ):
-    """
-    キャッシュからチャンネルを取得。
-    見つからなければAPIから取得。
-    """
 
     channel = client.get_channel(
         channel_id
@@ -120,6 +134,7 @@ async def get_channel_safe(
         return channel
 
     try:
+
         return await client.fetch_channel(
             channel_id
         )
@@ -129,15 +144,31 @@ async def get_channel_safe(
         discord.Forbidden,
         discord.HTTPException,
     ):
+
         return None
 
+
+def normalize_text(
+    text: str,
+) -> str:
+
+    return (
+        text
+        .strip()
+        .lower()
+        .replace(" ", "")
+        .replace("　", "")
+        .replace("\n", "")
+    )
+
+
+# ============================================================
+# 性別判定
+# ============================================================
 
 def member_gender(
     member: discord.Member,
 ) -> Optional[str]:
-    """
-    男性 / 女性ロール判定
-    """
 
     role_ids = {
         role.id
@@ -145,13 +176,11 @@ def member_gender(
     }
 
     has_male = (
-        MALE_ROLE_ID
-        in role_ids
+        MALE_ROLE_ID in role_ids
     )
 
     has_female = (
-        FEMALE_ROLE_ID
-        in role_ids
+        FEMALE_ROLE_ID in role_ids
     )
 
     if has_male and not has_female:
@@ -166,31 +195,24 @@ def member_gender(
 def profile_channel_candidates(
     member: discord.Member,
 ) -> list[int]:
-    """
-    性別ロールがある場合は
-    対応するプロフィールCHだけ検索。
-
-    性別ロールが無い場合は
-    男女両方のプロフィールCHを検索。
-
-    仮メンバー等で男性ロールを
-    付けていない場合にも対応。
-    """
 
     gender = member_gender(
         member
     )
 
     if gender == "male":
+
         return [
             MALE_PROFILE_CHANNEL_ID
         ]
 
     if gender == "female":
+
         return [
             FEMALE_PROFILE_CHANNEL_ID
         ]
 
+    # 性別ロールが無い場合は男女両方検索
     return [
         MALE_PROFILE_CHANNEL_ID,
         FEMALE_PROFILE_CHANNEL_ID,
@@ -198,15 +220,12 @@ def profile_channel_candidates(
 
 
 # ============================================================
-# プロフィール判定
+# Embedを検索用テキストに変換
 # ============================================================
 
 def embed_to_text(
     embed: discord.Embed,
 ) -> str:
-    """
-    Embed全体を検索用文字列へ変換
-    """
 
     parts: list[str] = []
 
@@ -220,17 +239,23 @@ def embed_to_text(
             embed.description
         )
 
-    if embed.author:
-        if embed.author.name:
-            parts.append(
-                embed.author.name
-            )
+    if (
+        embed.author
+        and embed.author.name
+    ):
 
-    if embed.footer:
-        if embed.footer.text:
-            parts.append(
-                embed.footer.text
-            )
+        parts.append(
+            embed.author.name
+        )
+
+    if (
+        embed.footer
+        and embed.footer.text
+    ):
+
+        parts.append(
+            embed.footer.text
+        )
 
     for field in embed.fields:
 
@@ -249,47 +274,41 @@ def embed_to_text(
     )
 
 
+# ============================================================
+# プロフィール本人判定
+# ============================================================
+
 def message_matches_member(
     message: discord.Message,
     member: discord.Member,
 ) -> bool:
-    """
-    プロフィール投稿が
-    指定メンバー本人のものか判定。
 
-    対応:
-    ・本人が直接プロフィール投稿
-    ・Botが本人をメンションして投稿
-    ・本文にユーザーID
-    ・EmbedにユーザーID / メンション
-    """
-
-    # ----------------------------------------
-    # 本人が直接投稿しているプロフィール
-    # ----------------------------------------
+    # ========================================================
+    # ① 本人が直接投稿
+    # ========================================================
 
     if (
         not message.author.bot
-        and message.author.id
-        == member.id
+        and message.author.id == member.id
     ):
         return True
+
+
+    # ========================================================
+    # ② Discord ID / メンション
+    # ========================================================
 
     user_id_text = str(
         member.id
     )
 
-    mention1 = (
+    mention_1 = (
         f"<@{member.id}>"
     )
 
-    mention2 = (
+    mention_2 = (
         f"<@!{member.id}>"
     )
-
-    # ----------------------------------------
-    # メッセージ本文
-    # ----------------------------------------
 
     content = (
         message.content
@@ -298,39 +317,119 @@ def message_matches_member(
 
     if (
         user_id_text in content
-        or mention1 in content
-        or mention2 in content
+        or mention_1 in content
+        or mention_2 in content
     ):
         return True
 
-    # ----------------------------------------
-    # Discordのmention情報
-    # ----------------------------------------
 
-    for mentioned_user in message.mentions:
+    # Discord mention情報
+    for user in message.mentions:
+
+        if user.id == member.id:
+            return True
+
+
+    # ========================================================
+    # ③ 名前候補
+    # ========================================================
+
+    display_name = normalize_text(
+        member.display_name
+    )
+
+    username = normalize_text(
+        member.name
+    )
+
+    global_name = normalize_text(
+        member.global_name
+        or ""
+    )
+
+    name_candidates = {
+        display_name,
+        username,
+        global_name,
+    }
+
+    name_candidates.discard("")
+
+
+    profile_title_candidates = {
+        f"{name}のプロフィール"
+        for name in name_candidates
+    }
+
+
+    # ========================================================
+    # ④ 本文の表示名
+    # ========================================================
+
+    normalized_content = normalize_text(
+        content
+    )
+
+    for name in name_candidates:
 
         if (
-            mentioned_user.id
-            == member.id
+            f"{name}のプロフィール"
+            in normalized_content
         ):
             return True
 
-    # ----------------------------------------
-    # Embed
-    # ----------------------------------------
+
+    # ========================================================
+    # ⑤ Embed
+    # ========================================================
 
     for embed in message.embeds:
 
-        text = embed_to_text(
-            embed
+        # Embedタイトル
+        if embed.title:
+
+            title = normalize_text(
+                embed.title
+            )
+
+            # 例：
+            # coconaのプロフィール
+            if title in profile_title_candidates:
+                return True
+
+            for name in name_candidates:
+
+                if (
+                    name
+                    and name in title
+                    and "プロフィール" in title
+                ):
+                    return True
+
+
+        # Embed全体
+        embed_text = normalize_text(
+            embed_to_text(
+                embed
+            )
         )
 
         if (
-            user_id_text in text
-            or mention1 in text
-            or mention2 in text
+            user_id_text in embed_text
+            or normalize_text(mention_1) in embed_text
+            or normalize_text(mention_2) in embed_text
         ):
             return True
+
+        for name in name_candidates:
+
+            if (
+                name
+                and name in embed_text
+                and "プロフィール" in embed_text
+            ):
+                return True
+
 
     return False
 
@@ -342,17 +441,16 @@ def message_matches_member(
 async def find_profile_message(
     member: discord.Member,
 ) -> Optional[discord.Message]:
-    """
-    本人のプロフィール投稿を検索。
-    新しい投稿から順に探す。
-    """
-
-    # ----------------------------------------
-    # キャッシュがあればURLは別関数で使用
-    # ----------------------------------------
 
     channel_ids = profile_channel_candidates(
         member
+    )
+
+    log.info(
+        "Searching profile | user=%s | name=%s | channels=%s",
+        member.id,
+        member.display_name,
+        channel_ids,
     )
 
     for channel_id in channel_ids:
@@ -370,17 +468,14 @@ async def find_profile_message(
 
             continue
 
+
         if not hasattr(
             channel,
             "history",
         ):
 
-            log.warning(
-                "Channel has no history(): %s",
-                channel_id,
-            )
-
             continue
+
 
         try:
 
@@ -406,19 +501,27 @@ async def find_profile_message(
 
                     return message
 
+
         except discord.Forbidden:
 
             log.warning(
-                "プロフィールCHを閲覧できません: %s",
+                "プロフィールCHを閲覧できません | channel=%s",
                 channel_id,
             )
 
         except discord.HTTPException:
 
             log.exception(
-                "プロフィール検索エラー: %s",
+                "プロフィール検索エラー | channel=%s",
                 channel_id,
             )
+
+
+    log.warning(
+        "Profile not found | user=%s | name=%s",
+        member.id,
+        member.display_name,
+    )
 
     return None
 
@@ -426,9 +529,6 @@ async def find_profile_message(
 async def get_profile_url(
     member: discord.Member,
 ) -> Optional[str]:
-    """
-    プロフィールURL取得
-    """
 
     cached = profile_cache.get(
         member.id
@@ -436,6 +536,7 @@ async def get_profile_url(
 
     if cached:
         return cached
+
 
     message = await find_profile_message(
         member
@@ -484,14 +585,16 @@ def create_profile_embed(
             240,
         )
 
+
     embed = discord.Embed(
         title="✨ プロフィール",
         description=(
             f"{member.mention} さんが"
-            "参加しました！"
+            "お部屋に参加しました！"
         ),
         color=color,
     )
+
 
     if profile_found:
 
@@ -514,6 +617,7 @@ def create_profile_embed(
             ),
             inline=False,
         )
+
 
     embed.set_thumbnail(
         url=member.display_avatar.url
@@ -549,7 +653,7 @@ def create_profile_view(
 
 
 # ============================================================
-# VCのインチャへプロフィール投稿
+# プロフィール投稿
 # ============================================================
 
 async def post_profile_to_voice_chat(
@@ -562,76 +666,158 @@ async def post_profile_to_voice_chat(
         member.id,
     )
 
-    if (
-        POST_ONCE_PER_ROOM
-        and key in posted_in_room
-    ):
 
-        log.info(
-            "Profile already posted | room=%s user=%s",
-            channel.id,
-            member.id,
+    lock = profile_locks.setdefault(
+        member.id,
+        asyncio.Lock(),
+    )
+
+
+    async with lock:
+
+        # 同じ人が既に表示されている場合
+        if key in posted_messages:
+
+            log.info(
+                "Profile already exists | room=%s | user=%s",
+                channel.id,
+                member.id,
+            )
+
+            return
+
+
+        profile_url = await get_profile_url(
+            member
         )
 
+
+        embed = create_profile_embed(
+            member,
+            profile_url is not None,
+        )
+
+
+        try:
+
+            if profile_url:
+
+                sent_message = await channel.send(
+                    embed=embed,
+                    view=create_profile_view(
+                        profile_url
+                    ),
+                    allowed_mentions=discord.AllowedMentions(
+                        users=True,
+                        roles=False,
+                        everyone=False,
+                    ),
+                )
+
+            else:
+
+                sent_message = await channel.send(
+                    embed=embed,
+                    allowed_mentions=discord.AllowedMentions(
+                        users=True,
+                        roles=False,
+                        everyone=False,
+                    ),
+                )
+
+
+            posted_messages[
+                key
+            ] = sent_message.id
+
+
+            log.info(
+                "Profile posted | room=%s | user=%s | message=%s",
+                channel.id,
+                member.id,
+                sent_message.id,
+            )
+
+
+        except discord.Forbidden:
+
+            log.warning(
+                "VCインチャへ送信できません | room=%s",
+                channel.id,
+            )
+
+
+        except discord.HTTPException:
+
+            log.exception(
+                "VCインチャ送信エラー | room=%s",
+                channel.id,
+            )
+
+
+# ============================================================
+# 退出時プロフィール削除
+# ============================================================
+
+async def delete_profile_message(
+    channel: discord.VoiceChannel,
+    member_id: int,
+) -> None:
+
+    key = (
+        channel.id,
+        member_id,
+    )
+
+
+    message_id = posted_messages.pop(
+        key,
+        None,
+    )
+
+
+    if message_id is None:
         return
 
-    profile_url = await get_profile_url(
-        member
-    )
-
-    embed = create_profile_embed(
-        member,
-        profile_url is not None,
-    )
 
     try:
 
-        if profile_url:
-
-            await channel.send(
-                embed=embed,
-                view=create_profile_view(
-                    profile_url
-                ),
-                allowed_mentions=discord.AllowedMentions(
-                    users=True,
-                    roles=False,
-                    everyone=False,
-                ),
-            )
-
-        else:
-
-            await channel.send(
-                embed=embed,
-                allowed_mentions=discord.AllowedMentions(
-                    users=True,
-                    roles=False,
-                    everyone=False,
-                ),
-            )
-
-        posted_in_room.add(
-            key
+        message = await channel.fetch_message(
+            message_id
         )
+
+        await message.delete()
+
 
         log.info(
-            "Profile posted | room=%s | user=%s",
+            "Profile deleted | room=%s | user=%s | message=%s",
             channel.id,
-            member.id,
+            member_id,
+            message_id,
         )
+
+
+    except discord.NotFound:
+
+        log.info(
+            "Profile message already deleted | room=%s | user=%s",
+            channel.id,
+            member_id,
+        )
+
 
     except discord.Forbidden:
 
         log.warning(
-            "VCインチャへ送信できません | room=%s",
+            "プロフィール投稿を削除できません | room=%s",
             channel.id,
         )
+
 
     except discord.HTTPException:
 
         log.exception(
-            "VCインチャ送信エラー | room=%s",
+            "プロフィール削除エラー | room=%s",
             channel.id,
         )
 
@@ -653,28 +839,36 @@ async def on_ready():
         ),
     )
 
+
     guild = client.get_guild(
         GUILD_ID
     )
 
+
     if guild:
 
         log.info(
-            "NOIR connected: %s (%s)",
+            "Connected: %s (%s)",
             guild.name,
             guild.id,
         )
 
+        log.info(
+            "Watching category: %s",
+            PROFILE_VOICE_CATEGORY_ID,
+        )
+
+
     else:
 
         log.warning(
-            "NOIR guild not found: %s",
+            "Guild not found: %s",
             GUILD_ID,
         )
 
 
 # ============================================================
-# VC入室監視
+# VC入退室監視
 # ============================================================
 
 @client.event
@@ -684,21 +878,62 @@ async def on_voice_state_update(
     after: discord.VoiceState,
 ):
 
-    # Bot自身や他Botは無視
     if member.bot:
         return
 
-    # NOIR以外は無視
+
     if member.guild.id != GUILD_ID:
         return
 
-    # VC変更なし
+
     if before.channel == after.channel:
         return
 
-    # 退出だけなら何もしない
+
+    log.info(
+        "VOICE EVENT | user=%s | before=%s | after=%s",
+        member.id,
+        (
+            before.channel.id
+            if before.channel
+            else None
+        ),
+        (
+            after.channel.id
+            if after.channel
+            else None
+        ),
+    )
+
+
+    # ========================================================
+    # ① 元いた対象VCから出た場合
+    # プロフィールカード削除
+    # ========================================================
+
+    if isinstance(
+        before.channel,
+        discord.VoiceChannel,
+    ):
+
+        if (
+            before.channel.category_id
+            == PROFILE_VOICE_CATEGORY_ID
+        ):
+
+            await delete_profile_message(
+                before.channel,
+                member.id,
+            )
+
+
+    # ========================================================
+    # ② 完全退出ならここで終了
+    # ========================================================
+
     if after.channel is None:
         return
+
 
     # VoiceChannelだけ
     if not isinstance(
@@ -707,27 +942,32 @@ async def on_voice_state_update(
     ):
         return
 
+
     channel = after.channel
 
-    # ----------------------------------------
-    # 新規開拓カテゴリー以外は無視
-    # ----------------------------------------
+
+    # ========================================================
+    # ③ 対象カテゴリー以外は無視
+    # ========================================================
 
     if (
         channel.category_id
-        != NEW_MEMBER_CATEGORY_ID
+        != PROFILE_VOICE_CATEGORY_ID
     ):
+
         return
 
+
     log.info(
-        "New member VC join | user=%s | room=%s",
+        "Profile VC join | user=%s | room=%s",
         member.id,
         channel.id,
     )
 
-    # ----------------------------------------
-    # VCのインチャへプロフィール
-    # ----------------------------------------
+
+    # ========================================================
+    # ④ プロフィール表示
+    # ========================================================
 
     await post_profile_to_voice_chat(
         channel,
@@ -737,7 +977,6 @@ async def on_voice_state_update(
 
 # ============================================================
 # VC削除時
-# メモリ上の投稿履歴を掃除
 # ============================================================
 
 @client.event
@@ -748,29 +987,30 @@ async def on_guild_channel_delete(
     if channel.guild.id != GUILD_ID:
         return
 
-    if channel.category_id != NEW_MEMBER_CATEGORY_ID:
-        return
 
     remove_keys = [
         key
-        for key in posted_in_room
+        for key in posted_messages
         if key[0] == channel.id
     ]
 
+
     for key in remove_keys:
-        posted_in_room.discard(
-            key
+
+        posted_messages.pop(
+            key,
+            None,
         )
 
+
     log.info(
-        "Deleted room cache cleared: %s",
+        "Deleted room cache cleared | room=%s",
         channel.id,
     )
 
 
 # ============================================================
-# プロフィール投稿が新しく作られた場合
-# キャッシュを更新
+# 新規プロフィール投稿キャッシュ
 # ============================================================
 
 @client.event
@@ -781,18 +1021,22 @@ async def on_message(
     if message.guild is None:
         return
 
+
     if message.guild.id != GUILD_ID:
         return
+
 
     if message.channel.id not in {
         MALE_PROFILE_CHANNEL_ID,
         FEMALE_PROFILE_CHANNEL_ID,
     }:
+
         return
 
-    # ----------------------------------------
-    # 本人が直接投稿した場合
-    # ----------------------------------------
+
+    # ========================================================
+    # 本人が直接投稿
+    # ========================================================
 
     if not message.author.bot:
 
@@ -800,14 +1044,16 @@ async def on_message(
             message.author.id
         ] = message.jump_url
 
+
         log.info(
             "Profile cache updated | user=%s",
             message.author.id,
         )
 
-    # ----------------------------------------
-    # メンションされたユーザー
-    # ----------------------------------------
+
+    # ========================================================
+    # メンション
+    # ========================================================
 
     for user in message.mentions:
 
@@ -815,14 +1061,16 @@ async def on_message(
             user.id
         ] = message.jump_url
 
-    # ----------------------------------------
-    # 本文 / EmbedからDiscord IDを抽出
-    # ----------------------------------------
+
+    # ========================================================
+    # 本文 / EmbedからDiscord ID抽出
+    # ========================================================
 
     searchable_text = (
         message.content
         or ""
     )
+
 
     for embed in message.embeds:
 
@@ -833,10 +1081,12 @@ async def on_message(
             )
         )
 
+
     possible_ids = re.findall(
         r"\b\d{17,20}\b",
         searchable_text,
     )
+
 
     for raw_id in possible_ids:
 
@@ -855,7 +1105,7 @@ async def on_message(
 
 
 # ============================================================
-# プロフィール編集時もキャッシュ更新
+# プロフィール編集時
 # ============================================================
 
 @client.event
@@ -867,20 +1117,25 @@ async def on_message_edit(
     if after.guild is None:
         return
 
+
     if after.guild.id != GUILD_ID:
         return
+
 
     if after.channel.id not in {
         MALE_PROFILE_CHANNEL_ID,
         FEMALE_PROFILE_CHANNEL_ID,
     }:
+
         return
+
 
     if not after.author.bot:
 
         profile_cache[
             after.author.id
         ] = after.jump_url
+
 
     for user in after.mentions:
 
@@ -900,6 +1155,7 @@ if __name__ == "__main__":
         raise RuntimeError(
             "環境変数 DISCORD_TOKEN が設定されていません。"
         )
+
 
     client.run(
         TOKEN
