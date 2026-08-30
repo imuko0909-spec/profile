@@ -12,7 +12,7 @@ from discord.ext import commands
 
 # =========================================================
 # 👤 VCプロフィールBot
-# しゃべレア対応
+# しゃべレア対応 / 二重投稿防止版
 # =========================================================
 
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
@@ -22,7 +22,7 @@ GUILD_ID = 1542420058775494666
 MALE_PROFILE_CHANNEL_ID = 1542429626905657415
 FEMALE_PROFILE_CHANNEL_ID = 1542429755750486026
 
-# しゃべレアの移動を待つ時間
+# しゃべレアの自動移動を待つ秒数
 PROFILE_DELAY = 5
 
 PORT = int(
@@ -122,19 +122,19 @@ bot = commands.Bot(
 # 保存用
 # =========================================================
 
-# ユーザーごとのプロフィール表示予約
+# ユーザーごとの表示予約Task
 profile_tasks: dict[
     int,
     asyncio.Task
 ] = {}
 
 
-# ユーザーごとの現在表示中プロフィール
+# 現在表示されているプロフィールカード
 #
 # user_id:
 # {
-#     "channel_id": xxxx,
-#     "message_id": xxxx
+#     "channel_id": int,
+#     "message_id": int
 # }
 #
 profile_messages: dict[
@@ -190,7 +190,7 @@ async def find_profile_message(
 ):
 
     # -----------------------------------------
-    # キャッシュにあれば即返す
+    # キャッシュがあれば即返す
     # -----------------------------------------
 
     cached = profile_cache.get(
@@ -209,7 +209,7 @@ async def find_profile_message(
     ]
 
     # -----------------------------------------
-    # 男性・女性プロフィール両方から検索
+    # 男性・女性プロフィール両方を探す
     # -----------------------------------------
 
     for channel_id in channel_ids:
@@ -219,6 +219,12 @@ async def find_profile_message(
         )
 
         if channel is None:
+
+            log.warning(
+                "プロフィールチャンネルが見つかりません: %s",
+                channel_id
+            )
+
             continue
 
         try:
@@ -259,7 +265,7 @@ async def find_profile_message(
 
 
 # =========================================================
-# プロフィール表示削除
+# 表示中プロフィール削除
 # =========================================================
 
 async def delete_profile_card(
@@ -272,6 +278,7 @@ async def delete_profile_card(
     )
 
     if not data:
+
         return
 
     channel = member.guild.get_channel(
@@ -279,6 +286,7 @@ async def delete_profile_card(
     )
 
     if channel is None:
+
         return
 
     try:
@@ -290,25 +298,25 @@ async def delete_profile_card(
         await message.delete()
 
         log.info(
-            "プロフィール削除: %s",
+            "✅ プロフィール削除: %s",
             member
         )
 
     except discord.NotFound:
 
-        # 既に削除済み
+        # すでに削除済み
         pass
 
     except discord.Forbidden:
 
         log.warning(
-            "プロフィール投稿を削除する権限がありません"
+            "プロフィールカードを削除する権限がありません"
         )
 
     except Exception:
 
         log.exception(
-            "プロフィール削除エラー"
+            "プロフィールカード削除エラー"
         )
 
 
@@ -317,7 +325,8 @@ async def delete_profile_card(
 # =========================================================
 
 async def delayed_profile_post(
-    member: discord.Member
+    member: discord.Member,
+    expected_channel_id: int
 ):
 
     try:
@@ -333,7 +342,7 @@ async def delayed_profile_post(
         guild = member.guild
 
         # -----------------------------------------
-        # 5秒後の最新メンバー情報
+        # 最新メンバー情報を確認
         # -----------------------------------------
 
         current_member = guild.get_member(
@@ -341,78 +350,93 @@ async def delayed_profile_post(
         )
 
         if current_member is None:
+
             return
 
-        # VCから既に抜けていたら終了
+        # VCから抜けていたら終了
         if (
             current_member.voice is None
             or
             current_member.voice.channel is None
         ):
+
             return
 
         current_vc = (
-            current_member
-            .voice
-            .channel
+            current_member.voice.channel
         )
 
         # -----------------------------------------
-        # プロフィールを検索
+        # 予約したVCと現在地が違う
+        #
+        # しゃべレア等で移動済みなので
+        # 古い予約は無効
+        # -----------------------------------------
+
+        if (
+            current_vc.id
+            !=
+            expected_channel_id
+        ):
+
+            log.info(
+                "古いプロフィール予約を中止: %s",
+                current_member
+            )
+
+            return
+
+        # -----------------------------------------
+        # すでに同じVCに表示済みなら
+        # 二重投稿しない
+        # -----------------------------------------
+
+        existing = profile_messages.get(
+            current_member.id
+        )
+
+        if (
+            existing
+            and
+            existing.get(
+                "channel_id"
+            )
+            ==
+            current_vc.id
+        ):
+
+            log.info(
+                "二重投稿防止: %s",
+                current_member
+            )
+
+            return
+
+        # -----------------------------------------
+        # 念のため以前のカードを削除
+        # -----------------------------------------
+
+        if existing:
+
+            await delete_profile_card(
+                current_member
+            )
+
+        # -----------------------------------------
+        # プロフィール検索
         # -----------------------------------------
 
         profile_message = await find_profile_message(
             current_member
         )
 
-        # プロフィール未登録の場合
-        if profile_message is None:
-
-            embed = discord.Embed(
-                title="🏫 プロフィール",
-                description=(
-                    f"{current_member.mention} さんが"
-                    "お部屋に参加しました！\n\n"
-                    "📖 **プロフィール**\n"
-                    "プロフィールはまだ登録されていません。\n\n"
-                    f"**ID:** {current_member.id}"
-                )
-            )
-
-            embed.set_thumbnail(
-                url=current_member.display_avatar.url
-            )
-
-            try:
-
-                sent = await current_vc.send(
-                    embed=embed
-                )
-
-                profile_messages[
-                    current_member.id
-                ] = {
-                    "channel_id":
-                        current_vc.id,
-                    "message_id":
-                        sent.id
-                }
-
-            except Exception:
-
-                log.exception(
-                    "プロフィール未登録表示エラー"
-                )
-
-            return
-
         # -----------------------------------------
-        # Embed作成
+        # Embed
         # -----------------------------------------
 
-        embed = discord.Embed(
-            title="🏫 プロフィール",
-            description=(
+        if profile_message:
+
+            description = (
                 f"{current_member.mention} さんが"
                 "お部屋に参加しました！\n\n"
                 "📖 **プロフィール**\n"
@@ -420,25 +444,50 @@ async def delayed_profile_post(
                 "確認できます。\n\n"
                 f"**ID:** {current_member.id}"
             )
+
+        else:
+
+            description = (
+                f"{current_member.mention} さんが"
+                "お部屋に参加しました！\n\n"
+                "📖 **プロフィール**\n"
+                "プロフィールはまだ登録されていません。\n\n"
+                f"**ID:** {current_member.id}"
+            )
+
+        embed = discord.Embed(
+            title="🏫 プロフィール",
+            description=description
         )
 
-        # Discordアイコン
         embed.set_thumbnail(
             url=current_member.display_avatar.url
         )
 
-        view = ProfileView(
-            profile_message.jump_url
-        )
-
         # -----------------------------------------
-        # VCのインチャへ投稿
+        # VCインチャへ投稿
         # -----------------------------------------
 
-        sent = await current_vc.send(
-            embed=embed,
-            view=view
-        )
+        if profile_message:
+
+            view = ProfileView(
+                profile_message.jump_url
+            )
+
+            sent = await current_vc.send(
+                embed=embed,
+                view=view
+            )
+
+        else:
+
+            sent = await current_vc.send(
+                embed=embed
+            )
+
+        # -----------------------------------------
+        # 投稿記録
+        # -----------------------------------------
 
         profile_messages[
             current_member.id
@@ -450,15 +499,19 @@ async def delayed_profile_post(
         }
 
         log.info(
-            "プロフィール表示: %s -> %s",
+            "✅ プロフィール表示: %s -> %s",
             current_member,
             current_vc.name
         )
 
     except asyncio.CancelledError:
 
-        # しゃべレア等で途中移動した場合
-        pass
+        log.info(
+            "プロフィール予約キャンセル: %s",
+            member
+        )
+
+        return
 
     except discord.Forbidden:
 
@@ -474,7 +527,6 @@ async def delayed_profile_post(
 
     finally:
 
-        # 自分自身のTaskなら削除
         current_task = asyncio.current_task()
 
         if (
@@ -491,7 +543,7 @@ async def delayed_profile_post(
 
 
 # =========================================================
-# VC入退室
+# VC入退室・移動
 # =========================================================
 
 @bot.event
@@ -503,22 +555,41 @@ async def on_voice_state_update(
 
     # Botは無視
     if member.bot:
+
         return
 
     # 対象サーバーのみ
     if member.guild.id != GUILD_ID:
+
         return
 
     # -----------------------------------------
     # 同じVCなら無視
-    # ミュートON/OFF等
+    #
+    # ミュート・スピーカー変更など
     # -----------------------------------------
 
     if before.channel == after.channel:
+
         return
 
+    log.info(
+        "VC変化: %s | %s -> %s",
+        member,
+        (
+            before.channel.name
+            if before.channel
+            else "NONE"
+        ),
+        (
+            after.channel.name
+            if after.channel
+            else "NONE"
+        )
+    )
+
     # -----------------------------------------
-    # 古い予約があればキャンセル
+    # 古い表示予約をキャンセル
     # -----------------------------------------
 
     old_task = profile_tasks.pop(
@@ -529,6 +600,18 @@ async def on_voice_state_update(
     if old_task:
 
         old_task.cancel()
+
+        try:
+
+            await old_task
+
+        except asyncio.CancelledError:
+
+            pass
+
+        except Exception:
+
+            pass
 
     # -----------------------------------------
     # 元VCのプロフィールを削除
@@ -545,21 +628,26 @@ async def on_voice_state_update(
     if after.channel is None:
 
         log.info(
-            "VC退出: %s",
+            "✅ VC退出: %s",
             member
         )
 
         return
 
     # -----------------------------------------
-    # VC入室 / VC移動
+    # VC入室・移動
     #
-    # 5秒後に現在地を再確認
+    # このVC IDを予約時の目的地として保存
     # -----------------------------------------
+
+    expected_channel_id = (
+        after.channel.id
+    )
 
     task = asyncio.create_task(
         delayed_profile_post(
-            member
+            member,
+            expected_channel_id
         )
     )
 
@@ -569,8 +657,7 @@ async def on_voice_state_update(
 
 
 # =========================================================
-# プロフィール投稿が追加された時
-# キャッシュ更新
+# プロフィール投稿更新
 # =========================================================
 
 @bot.event
@@ -579,13 +666,21 @@ async def on_message(
 ):
 
     if message.author.bot:
+
         return
 
     if message.guild is None:
+
         return
 
     if message.guild.id != GUILD_ID:
+
         return
+
+    # -----------------------------------------
+    # プロフィールチャンネルへの投稿なら
+    # キャッシュ更新
+    # -----------------------------------------
 
     if message.channel.id in {
         MALE_PROFILE_CHANNEL_ID,
@@ -597,7 +692,7 @@ async def on_message(
         ] = message
 
         log.info(
-            "プロフィールキャッシュ更新: %s",
+            "✅ プロフィールキャッシュ更新: %s",
             message.author
         )
 
@@ -607,8 +702,7 @@ async def on_message(
 
 
 # =========================================================
-# プロフィール削除時
-# キャッシュ削除
+# プロフィール投稿削除
 # =========================================================
 
 @bot.event
@@ -617,34 +711,49 @@ async def on_raw_message_delete(
 ):
 
     if payload.guild_id != GUILD_ID:
+
         return
 
     if payload.channel_id not in {
         MALE_PROFILE_CHANNEL_ID,
         FEMALE_PROFILE_CHANNEL_ID
     }:
+
         return
 
-    delete_users = []
+    remove_users = []
 
-    for user_id, message in profile_cache.items():
+    for (
+        user_id,
+        message
+    ) in profile_cache.items():
 
-        if message.id == payload.message_id:
+        if (
+            message.id
+            ==
+            payload.message_id
+        ):
 
-            delete_users.append(
+            remove_users.append(
                 user_id
             )
 
-    for user_id in delete_users:
+    for user_id in remove_users:
 
         profile_cache.pop(
             user_id,
             None
         )
 
+        log.info(
+            "プロフィールキャッシュ削除: %s",
+            user_id
+        )
+
 
 # =========================================================
-# READY
+# Bot起動時に
+# すでにVCにいる人は記録だけ初期化
 # =========================================================
 
 @bot.event
@@ -679,8 +788,12 @@ async def on_ready():
     )
 
     log.info(
-        "プロフィール待機: %s秒",
+        "待機時間: %s秒",
         PROFILE_DELAY
+    )
+
+    log.info(
+        "二重投稿防止: ON"
     )
 
     log.info(
