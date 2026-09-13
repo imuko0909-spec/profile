@@ -19,9 +19,14 @@ from PIL import Image, ImageDraw, ImageEnhance, ImageFont
 # =========================================================
 # 🍬 Candy
 # VCプロフィール + Voice/Text/Total Level Bot
+#
+# ★ レベル低下防止版
+# 一度到達したレベルは通常処理では下がりません。
+# 管理者が減算 / リセットした場合のみ下がります。
 # =========================================================
 
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
+
 
 # =========================================================
 # Candy サーバー設定
@@ -42,8 +47,13 @@ DUPLICATE_CHECK_LIMIT = 20
 # Text XP
 # =========================================================
 
+# 同じ人がTC XPをもらえる間隔
 TEXT_XP_COOLDOWN = 60
+
+# これ未満の文字数はXPなし
 TEXT_MIN_LENGTH = 3
+
+# 1回の有効発言で増えるXP
 TEXT_XP_PER_MESSAGE = 1
 
 
@@ -102,13 +112,14 @@ log = logging.getLogger(
 
 
 # =========================================================
-# DATABASE
+# DATABASE接続
 # =========================================================
 
 def db_connect():
 
     conn = sqlite3.connect(
-        DB_PATH
+        DB_PATH,
+        timeout=30
     )
 
     conn.row_factory = sqlite3.Row
@@ -116,9 +127,17 @@ def db_connect():
     return conn
 
 
+# =========================================================
+# DATABASE初期化
+# =========================================================
+
 def init_database():
 
     with db_connect() as conn:
+
+        # -----------------------------------------
+        # VC累計時間
+        # -----------------------------------------
 
         conn.execute(
             """
@@ -129,6 +148,10 @@ def init_database():
             """
         )
 
+        # -----------------------------------------
+        # TC XP
+        # -----------------------------------------
+
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS text_stats (
@@ -138,11 +161,33 @@ def init_database():
             """
         )
 
+        # -----------------------------------------
+        # レベルロール
+        # -----------------------------------------
+
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS level_roles (
                 level INTEGER PRIMARY KEY,
                 role_id INTEGER NOT NULL
+            )
+            """
+        )
+
+        # -----------------------------------------
+        # ★ 最高到達レベル
+        #
+        # 通常計算値が一時的に低くなっても
+        # ここに保存した最高Lvより下げない
+        # -----------------------------------------
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS level_peaks (
+                user_id INTEGER PRIMARY KEY,
+                voice_level INTEGER NOT NULL DEFAULT 1,
+                text_level INTEGER NOT NULL DEFAULT 1,
+                total_level INTEGER NOT NULL DEFAULT 2
             )
             """
         )
@@ -169,7 +214,9 @@ def db_get_voice_seconds(
             FROM voice_stats
             WHERE user_id = ?
             """,
-            (user_id,)
+            (
+                user_id,
+            )
         ).fetchone()
 
     if row is None:
@@ -187,7 +234,7 @@ def db_set_voice_seconds(
 
     seconds = max(
         0.0,
-        seconds
+        float(seconds)
     )
 
     with db_connect() as conn:
@@ -217,6 +264,10 @@ def db_add_voice_seconds(
     user_id: int,
     seconds: float
 ):
+
+    seconds = float(
+        seconds
+    )
 
     if seconds <= 0:
         return
@@ -263,7 +314,9 @@ def db_get_text_xp(
             FROM text_stats
             WHERE user_id = ?
             """,
-            (user_id,)
+            (
+                user_id,
+            )
         ).fetchone()
 
     if row is None:
@@ -312,6 +365,10 @@ def db_add_text_xp(
     xp: int
 ):
 
+    xp = int(
+        xp
+    )
+
     if xp <= 0:
         return
 
@@ -335,6 +392,150 @@ def db_add_text_xp(
             (
                 user_id,
                 xp
+            )
+        )
+
+        conn.commit()
+
+
+# =========================================================
+# ★ 最高到達レベル DB
+# =========================================================
+
+def db_get_peaks(
+    user_id: int
+):
+
+    with db_connect() as conn:
+
+        row = conn.execute(
+            """
+            SELECT
+                voice_level,
+                text_level,
+                total_level
+            FROM level_peaks
+            WHERE user_id = ?
+            """,
+            (
+                user_id,
+            )
+        ).fetchone()
+
+    if row is None:
+
+        return (
+            1,
+            1,
+            2
+        )
+
+    return (
+        int(
+            row["voice_level"]
+        ),
+        int(
+            row["text_level"]
+        ),
+        int(
+            row["total_level"]
+        )
+    )
+
+
+def db_save_peak_levels(
+    user_id: int,
+    voice_level: int,
+    text_level: int,
+    total_level: int
+):
+
+    """
+    通常処理用。
+
+    既存の最高到達Lvより高い場合のみ更新。
+    低い値が来ても下げません。
+    """
+
+    with db_connect() as conn:
+
+        conn.execute(
+            """
+            INSERT INTO level_peaks (
+                user_id,
+                voice_level,
+                text_level,
+                total_level
+            )
+            VALUES (?, ?, ?, ?)
+
+            ON CONFLICT(user_id)
+            DO UPDATE SET
+                voice_level =
+                    MAX(
+                        level_peaks.voice_level,
+                        excluded.voice_level
+                    ),
+
+                text_level =
+                    MAX(
+                        level_peaks.text_level,
+                        excluded.text_level
+                    ),
+
+                total_level =
+                    MAX(
+                        level_peaks.total_level,
+                        excluded.total_level
+                    )
+            """,
+            (
+                user_id,
+                voice_level,
+                text_level,
+                total_level
+            )
+        )
+
+        conn.commit()
+
+
+def db_force_peak_levels(
+    user_id: int,
+    voice_level: int,
+    text_level: int,
+    total_level: int
+):
+
+    """
+    管理者が意図的にレベルを減らした時用。
+
+    この関数だけは最高到達Lvを下げられます。
+    """
+
+    with db_connect() as conn:
+
+        conn.execute(
+            """
+            INSERT INTO level_peaks (
+                user_id,
+                voice_level,
+                text_level,
+                total_level
+            )
+            VALUES (?, ?, ?, ?)
+
+            ON CONFLICT(user_id)
+            DO UPDATE SET
+                voice_level = excluded.voice_level,
+                text_level = excluded.text_level,
+                total_level = excluded.total_level
+            """,
+            (
+                user_id,
+                voice_level,
+                text_level,
+                total_level
             )
         )
 
@@ -384,7 +585,9 @@ def db_remove_level_role(
             DELETE FROM level_roles
             WHERE level = ?
             """,
-            (level,)
+            (
+                level,
+            )
         )
 
         conn.commit()
@@ -394,17 +597,23 @@ def db_get_level_roles():
 
     with db_connect() as conn:
 
-        return conn.execute(
+        rows = conn.execute(
             """
-            SELECT level, role_id
+            SELECT
+                level,
+                role_id
             FROM level_roles
             ORDER BY level ASC
             """
         ).fetchall()
 
+    return rows
+
 
 # =========================================================
 # VOICE LEVEL
+#
+# Lv5 = 累計10時間
 # =========================================================
 
 def voice_required_hours(
@@ -440,7 +649,9 @@ def voice_required_seconds(
 ) -> float:
 
     return (
-        voice_required_hours(level)
+        voice_required_hours(
+            level
+        )
         *
         3600
     )
@@ -449,6 +660,11 @@ def voice_required_seconds(
 def calculate_voice_level(
     seconds: float
 ) -> int:
+
+    seconds = max(
+        0.0,
+        float(seconds)
+    )
 
     level = 1
 
@@ -464,60 +680,12 @@ def calculate_voice_level(
                 next_level
             )
         ):
+
             break
 
         level = next_level
 
     return level
-
-
-def voice_progress(
-    seconds: float
-):
-
-    level = calculate_voice_level(
-        seconds
-    )
-
-    current_required = (
-        voice_required_seconds(
-            level
-        )
-    )
-
-    next_required = (
-        voice_required_seconds(
-            level + 1
-        )
-    )
-
-    current = max(
-        0,
-        seconds
-        -
-        current_required
-    )
-
-    needed = max(
-        1,
-        next_required
-        -
-        current_required
-    )
-
-    percent = min(
-        1.0,
-        current
-        /
-        needed
-    )
-
-    return (
-        level,
-        current,
-        needed,
-        percent
-    )
 
 
 # =========================================================
@@ -556,6 +724,11 @@ def calculate_text_level(
     xp: int
 ) -> int:
 
+    xp = max(
+        0,
+        int(xp)
+    )
+
     level = 1
 
     for next_level in range(
@@ -563,9 +736,14 @@ def calculate_text_level(
         1001
     ):
 
-        if xp < text_required_xp(
-            next_level
+        if (
+            xp
+            <
+            text_required_xp(
+                next_level
+            )
         ):
+
             break
 
         level = next_level
@@ -573,13 +751,76 @@ def calculate_text_level(
     return level
 
 
-def text_progress(
-    xp: int
+# =========================================================
+# TOTAL LEVEL
+# =========================================================
+
+def calculate_total_level(
+    voice_level: int,
+    text_level: int
+) -> int:
+
+    return (
+        int(voice_level)
+        +
+        int(text_level)
+    )
+
+
+# =========================================================
+# 進捗計算
+# =========================================================
+
+def voice_progress_from_level(
+    seconds: float,
+    level: int
 ):
 
-    level = calculate_text_level(
-        xp
+    current_required = (
+        voice_required_seconds(
+            level
+        )
     )
+
+    next_required = (
+        voice_required_seconds(
+            level + 1
+        )
+    )
+
+    current = max(
+        0.0,
+        seconds
+        -
+        current_required
+    )
+
+    needed = max(
+        1.0,
+        next_required
+        -
+        current_required
+    )
+
+    percent = max(
+        0.0,
+        min(
+            1.0,
+            current / needed
+        )
+    )
+
+    return (
+        current,
+        needed,
+        percent
+    )
+
+
+def text_progress_from_level(
+    xp: int,
+    level: int
+):
 
     current_required = (
         text_required_xp(
@@ -607,34 +848,18 @@ def text_progress(
         current_required
     )
 
-    percent = min(
-        1.0,
-        current
-        /
-        needed
+    percent = max(
+        0.0,
+        min(
+            1.0,
+            current / needed
+        )
     )
 
     return (
-        level,
         current,
         needed,
         percent
-    )
-
-
-# =========================================================
-# TOTAL LEVEL
-# =========================================================
-
-def calculate_total_level(
-    voice_level: int,
-    text_level: int
-) -> int:
-
-    return (
-        voice_level
-        +
-        text_level
     )
 
 
@@ -678,7 +903,10 @@ class HealthHandler(
 
     def do_GET(self):
 
-        self.send_response(200)
+        self.send_response(
+            200
+        )
+
         self.end_headers()
 
         self.wfile.write(
@@ -769,7 +997,10 @@ def is_admin_member(
         return True
 
     return any(
-        role.id == ADMIN_ROLE_ID
+        role.id
+        ==
+        ADMIN_ROLE_ID
+
         for role in member.roles
     )
 
@@ -816,6 +1047,7 @@ def is_countable_voice_channel(
     if channel is None:
         return False
 
+    # AFKチャンネルは加算しない
     if (
         guild.afk_channel
         and
@@ -823,6 +1055,7 @@ def is_countable_voice_channel(
         ==
         channel.id
     ):
+
         return False
 
     return True
@@ -854,7 +1087,7 @@ def start_voice_session(
 
 async def flush_voice_session(
     user_id: int,
-    keep_running=True
+    keep_running: bool = True
 ):
 
     started = voice_sessions.get(
@@ -867,7 +1100,7 @@ async def flush_voice_session(
     now = time.time()
 
     elapsed = max(
-        0,
+        0.0,
         now - started
     )
 
@@ -904,10 +1137,10 @@ def get_live_voice_seconds(
         user_id
     )
 
-    if started:
+    if started is not None:
 
         total += max(
-            0,
+            0.0,
             time.time()
             -
             started
@@ -917,10 +1150,101 @@ def get_live_voice_seconds(
 
 
 # =========================================================
-# TOTAL LEVEL取得
+# ★ レベル取得
+#
+# calculate → 現在計算値
+# peak      → 最高到達値
+#
+# 通常表示では高い方を使用
 # =========================================================
 
 def get_member_levels(
+    user_id: int,
+    save_peak: bool = True
+):
+
+    voice_seconds = (
+        get_live_voice_seconds(
+            user_id
+        )
+    )
+
+    text_xp = (
+        db_get_text_xp(
+            user_id
+        )
+    )
+
+    calculated_voice = (
+        calculate_voice_level(
+            voice_seconds
+        )
+    )
+
+    calculated_text = (
+        calculate_text_level(
+            text_xp
+        )
+    )
+
+    calculated_total = (
+        calculate_total_level(
+            calculated_voice,
+            calculated_text
+        )
+    )
+
+    (
+        peak_voice,
+        peak_text,
+        peak_total
+    ) = db_get_peaks(
+        user_id
+    )
+
+    voice_level = max(
+        calculated_voice,
+        peak_voice
+    )
+
+    text_level = max(
+        calculated_text,
+        peak_text
+    )
+
+    total_level = max(
+        calculate_total_level(
+            voice_level,
+            text_level
+        ),
+        calculated_total,
+        peak_total
+    )
+
+    if save_peak:
+
+        db_save_peak_levels(
+            user_id,
+            voice_level,
+            text_level,
+            total_level
+        )
+
+    return (
+        voice_seconds,
+        text_xp,
+        voice_level,
+        text_level,
+        total_level
+    )
+
+
+# =========================================================
+# 管理者が意図的に減算した後
+# 最高到達レベルも現在値へ更新
+# =========================================================
+
+def force_current_levels_as_peak(
     user_id: int
 ):
 
@@ -930,8 +1254,10 @@ def get_member_levels(
         )
     )
 
-    text_xp = db_get_text_xp(
-        user_id
+    text_xp = (
+        db_get_text_xp(
+            user_id
+        )
     )
 
     voice_level = (
@@ -953,9 +1279,14 @@ def get_member_levels(
         )
     )
 
+    db_force_peak_levels(
+        user_id,
+        voice_level,
+        text_level,
+        total_level
+    )
+
     return (
-        voice_seconds,
-        text_xp,
         voice_level,
         text_level,
         total_level
@@ -1009,16 +1340,21 @@ async def sync_level_roles(
         text_level,
         total_level
     ) = get_member_levels(
-        member.id
+        member.id,
+        save_peak=True
     )
 
-    settings = db_get_level_roles()
+    settings = (
+        db_get_level_roles()
+    )
 
     if not settings:
         return
 
     configured_ids = {
-        int(row["role_id"])
+        int(
+            row["role_id"]
+        )
         for row in settings
     }
 
@@ -1034,12 +1370,10 @@ async def sync_level_roles(
 
         if (
             role.id
-            in
-            configured_ids
+            in configured_ids
             and
             role.id
-            !=
-            target_role_id
+            != target_role_id
         ):
 
             remove_roles.append(
@@ -1054,6 +1388,13 @@ async def sync_level_roles(
                 *remove_roles,
                 reason="Candy レベルランク更新"
             )
+
+    except discord.Forbidden:
+
+        log.warning(
+            "ロール削除権限なし: %s",
+            member
+        )
 
     except Exception:
 
@@ -1092,6 +1433,13 @@ async def sync_level_roles(
             target_role.name
         )
 
+    except discord.Forbidden:
+
+        log.warning(
+            "ロール付与権限なし: %s",
+            target_role.name
+        )
+
     except Exception:
 
         log.exception(
@@ -1100,7 +1448,7 @@ async def sync_level_roles(
 
 
 # =========================================================
-# 1分ごと VC保存
+# 1分ごとVC保存
 # =========================================================
 
 @tasks.loop(
@@ -1187,7 +1535,7 @@ class ProfileView(
 
     def __init__(
         self,
-        url
+        url: str
     ):
 
         super().__init__(
@@ -1209,14 +1557,14 @@ class ProfileView(
 # =========================================================
 
 async def find_profile_message(
-    member
+    member: discord.Member
 ):
 
     cached = profile_cache.get(
         member.id
     )
 
-    if cached:
+    if cached is not None:
         return cached
 
     for channel_id in [
@@ -1268,7 +1616,7 @@ async def find_profile_message(
 
 async def profile_already_exists(
     channel,
-    user_id
+    user_id: int
 ):
 
     targets = (
@@ -1288,6 +1636,7 @@ async def profile_already_exists(
                 message.author.id
                 != bot.user.id
             ):
+
                 continue
 
             for embed in message.embeds:
@@ -1299,19 +1648,21 @@ async def profile_already_exists(
                 )
 
                 if any(
-                    x in description
-                    for x in targets
+                    target in description
+                    for target in targets
                 ):
 
                     return message
 
+            content = (
+                message.content
+                or
+                ""
+            )
+
             if any(
-                x in (
-                    message.content
-                    or
-                    ""
-                )
-                for x in targets
+                target in content
+                for target in targets
             ):
 
                 return message
@@ -1330,7 +1681,7 @@ async def profile_already_exists(
 # =========================================================
 
 async def delete_profile_card(
-    member
+    member: discord.Member
 ):
 
     data = profile_messages.pop(
@@ -1347,7 +1698,7 @@ async def delete_profile_card(
         )
     )
 
-    if not channel:
+    if channel is None:
         return
 
     try:
@@ -1362,12 +1713,15 @@ async def delete_profile_card(
         pass
 
     except Exception:
-        pass
+
+        log.exception(
+            "プロフィール削除失敗"
+        )
 
 
 async def delete_profile_cards_from_channel(
     channel,
-    user_id
+    user_id: int
 ):
 
     targets = (
@@ -1387,6 +1741,7 @@ async def delete_profile_cards_from_channel(
                 message.author.id
                 != bot.user.id
             ):
+
                 continue
 
             matched = False
@@ -1400,8 +1755,8 @@ async def delete_profile_cards_from_channel(
                 )
 
                 if any(
-                    x in text
-                    for x in targets
+                    target in text
+                    for target in targets
                 ):
 
                     matched = True
@@ -1409,13 +1764,15 @@ async def delete_profile_cards_from_channel(
 
             if not matched:
 
+                content = (
+                    message.content
+                    or
+                    ""
+                )
+
                 if any(
-                    x in (
-                        message.content
-                        or
-                        ""
-                    )
-                    for x in targets
+                    target in content
+                    for target in targets
                 ):
 
                     matched = True
@@ -1423,7 +1780,9 @@ async def delete_profile_cards_from_channel(
             if matched:
 
                 try:
+
                     await message.delete()
+
                 except Exception:
                     pass
 
@@ -1439,8 +1798,8 @@ async def delete_profile_cards_from_channel(
 # =========================================================
 
 async def delayed_profile_post(
-    member,
-    expected_channel_id
+    member: discord.Member,
+    expected_channel_id: int
 ):
 
     try:
@@ -1457,7 +1816,7 @@ async def delayed_profile_post(
             )
         )
 
-        if not current_member:
+        if current_member is None:
             return
 
         if (
@@ -1465,6 +1824,7 @@ async def delayed_profile_post(
             or
             current_member.voice.channel is None
         ):
+
             return
 
         current_vc = (
@@ -1476,6 +1836,7 @@ async def delayed_profile_post(
             !=
             expected_channel_id
         ):
+
             return
 
         duplicate = (
@@ -1492,6 +1853,7 @@ async def delayed_profile_post(
             ] = {
                 "channel_id":
                     current_vc.id,
+
                 "message_id":
                     duplicate.id
             }
@@ -1574,6 +1936,7 @@ async def delayed_profile_post(
         ] = {
             "channel_id":
                 current_vc.id,
+
             "message_id":
                 sent.id
         }
@@ -1605,11 +1968,11 @@ async def delayed_profile_post(
 
 
 # =========================================================
-# LEVEL CARD FONT
+# FONT
 # =========================================================
 
 def get_font(
-    size
+    size: int
 ):
 
     paths = [
@@ -1640,12 +2003,12 @@ def get_font(
 
 
 # =========================================================
-# デフォルト背景
+# 標準背景
 # =========================================================
 
 def make_default_background(
-    width,
-    height
+    width: int,
+    height: int
 ):
 
     image = Image.new(
@@ -1669,7 +2032,11 @@ def make_default_background(
         height
     ):
 
-        ratio = y / height
+        ratio = (
+            y
+            /
+            height
+        )
 
         draw.line(
             (
@@ -1679,9 +2046,21 @@ def make_default_background(
                 y
             ),
             fill=(
-                int(55 + 45 * ratio),
-                int(38 + 25 * ratio),
-                int(80 + 55 * ratio)
+                int(
+                    55
+                    +
+                    45 * ratio
+                ),
+                int(
+                    38
+                    +
+                    25 * ratio
+                ),
+                int(
+                    80
+                    +
+                    55 * ratio
+                )
             )
         )
 
@@ -1717,11 +2096,11 @@ def make_default_background(
 
 
 # =========================================================
-# 背景ファイル
+# 個人背景
 # =========================================================
 
 def get_background_path(
-    user_id
+    user_id: int
 ):
 
     return (
@@ -1730,10 +2109,6 @@ def get_background_path(
         f"{user_id}.jpg"
     )
 
-
-# =========================================================
-# 背景画像保存
-# =========================================================
 
 def save_background_image(
     user_id: int,
@@ -1814,37 +2189,35 @@ def save_background_image(
         )
     )
 
-    path = get_background_path(
-        user_id
-    )
-
     image.save(
-        path,
+        get_background_path(
+            user_id
+        ),
         "JPEG",
         quality=90
     )
 
 
 # =========================================================
-# レベルカード
+# LEVEL CARD
 # =========================================================
 
 def make_level_card(
-    avatar_bytes,
-    display_name,
-    total_level,
-    voice_level,
-    text_level,
-    voice_seconds,
-    text_xp,
-    voice_percent,
-    voice_current,
-    voice_needed,
-    text_percent,
-    text_current,
-    text_needed,
-    role_name,
-    background_path
+    avatar_bytes: bytes,
+    display_name: str,
+    total_level: int,
+    voice_level: int,
+    text_level: int,
+    voice_seconds: float,
+    text_xp: int,
+    voice_percent: float,
+    voice_current: float,
+    voice_needed: float,
+    text_percent: float,
+    text_current: int,
+    text_needed: int,
+    role_name: str,
+    background_path: str
 ):
 
     width = 1000
@@ -1884,9 +2257,11 @@ def make_level_card(
 
     else:
 
-        image = make_default_background(
-            width,
-            height
+        image = (
+            make_default_background(
+                width,
+                height
+            )
         )
 
     enhancer = ImageEnhance.Brightness(
@@ -1917,6 +2292,10 @@ def make_level_card(
             125
         )
     )
+
+    # -----------------------------------------
+    # Avatar
+    # -----------------------------------------
 
     try:
 
@@ -1992,11 +2371,29 @@ def make_level_card(
             "Avatar描画失敗"
         )
 
-    font_name = get_font(32)
-    font_big = get_font(70)
-    font_medium = get_font(25)
-    font_small = get_font(18)
-    font_tiny = get_font(15)
+    font_name = get_font(
+        32
+    )
+
+    font_big = get_font(
+        70
+    )
+
+    font_medium = get_font(
+        25
+    )
+
+    font_small = get_font(
+        18
+    )
+
+    font_tiny = get_font(
+        15
+    )
+
+    # -----------------------------------------
+    # 名前
+    # -----------------------------------------
 
     draw.text(
         (
@@ -2012,6 +2409,10 @@ def make_level_card(
             255
         )
     )
+
+    # -----------------------------------------
+    # ランク
+    # -----------------------------------------
 
     if role_name:
 
@@ -2029,6 +2430,10 @@ def make_level_card(
                 255
             )
         )
+
+    # -----------------------------------------
+    # TOTAL
+    # -----------------------------------------
 
     draw.text(
         (
@@ -2050,7 +2455,9 @@ def make_level_card(
             830,
             70
         ),
-        str(total_level),
+        str(
+            total_level
+        ),
         font=font_big,
         fill=(
             255,
@@ -2059,6 +2466,10 @@ def make_level_card(
             255
         )
     )
+
+    # -----------------------------------------
+    # TEXT
+    # -----------------------------------------
 
     draw.text(
         (
@@ -2149,6 +2560,10 @@ def make_level_card(
             255
         )
     )
+
+    # -----------------------------------------
+    # VOICE
+    # -----------------------------------------
 
     draw.text(
         (
@@ -2282,7 +2697,9 @@ def make_level_card(
         "PNG"
     )
 
-    output.seek(0)
+    output.seek(
+        0
+    )
 
     return output
 
@@ -2307,44 +2724,47 @@ async def level_command(
         member,
         discord.Member
     ):
+
         return
 
     await interaction.response.defer()
 
-    voice_seconds = (
-        get_live_voice_seconds(
-            member.id
-        )
+    (
+        voice_seconds,
+        text_xp,
+        voice_level,
+        text_level,
+        total_level
+    ) = get_member_levels(
+        member.id,
+        save_peak=True
     )
 
-    text_xp = db_get_text_xp(
-        member.id
-    )
+    # -----------------------------------------
+    # 進捗
+    # -----------------------------------------
 
     (
-        voice_level,
         voice_current,
         voice_needed,
         voice_percent
-    ) = voice_progress(
-        voice_seconds
+    ) = voice_progress_from_level(
+        voice_seconds,
+        voice_level
     )
 
     (
-        text_level,
         text_current,
         text_needed,
         text_percent
-    ) = text_progress(
-        text_xp
+    ) = text_progress_from_level(
+        text_xp,
+        text_level
     )
 
-    total_level = (
-        calculate_total_level(
-            voice_level,
-            text_level
-        )
-    )
+    # -----------------------------------------
+    # ランク
+    # -----------------------------------------
 
     role_name = ""
 
@@ -2364,6 +2784,10 @@ async def level_command(
 
             role_name = role.name
 
+    # -----------------------------------------
+    # サーバーアバター優先
+    # -----------------------------------------
+
     avatar = (
         member.guild_avatar
         or
@@ -2374,11 +2798,9 @@ async def level_command(
         await avatar.read()
     )
 
-    background_path = (
-        str(
-            get_background_path(
-                member.id
-            )
+    background_path = str(
+        get_background_path(
+            member.id
         )
     )
 
@@ -2435,9 +2857,14 @@ async def level_background(
         member,
         discord.Member
     ):
+
         return
 
-    if image.size > 8 * 1024 * 1024:
+    if (
+        image.size
+        >
+        8 * 1024 * 1024
+    ):
 
         await interaction.response.send_message(
             "❌ 画像は8MB以下にしてください。",
@@ -2518,6 +2945,7 @@ async def level_background_reset(
     try:
 
         if path.exists():
+
             path.unlink()
 
     except Exception:
@@ -2534,7 +2962,7 @@ async def level_background_reset(
 
 # =========================================================
 # 管理者
-# レベルロール設定
+# LEVEL ROLE SET
 # =========================================================
 
 @bot.tree.command(
@@ -2554,6 +2982,7 @@ async def levelrole_set(
     if not await require_admin(
         interaction
     ):
+
         return
 
     if role.is_default():
@@ -2580,6 +3009,11 @@ async def levelrole_set(
     )
 
 
+# =========================================================
+# 管理者
+# LEVEL ROLE REMOVE
+# =========================================================
+
 @bot.tree.command(
     name="levelrole_remove",
     description="レベルロール設定を削除",
@@ -2596,6 +3030,7 @@ async def levelrole_remove(
     if not await require_admin(
         interaction
     ):
+
         return
 
     db_remove_level_role(
@@ -2607,6 +3042,11 @@ async def levelrole_remove(
         ephemeral=True
     )
 
+
+# =========================================================
+# 管理者
+# LEVEL ROLE LIST
+# =========================================================
 
 @bot.tree.command(
     name="levelrole_list",
@@ -2623,6 +3063,7 @@ async def levelrole_list(
     if not await require_admin(
         interaction
     ):
+
         return
 
     rows = db_get_level_roles()
@@ -2653,14 +3094,19 @@ async def levelrole_list(
         )
 
         lines.append(
-            f"**Total Lv.{row['level']}** → {role_text}"
+            (
+                f"**Total Lv.{row['level']}**"
+                f" → {role_text}"
+            )
         )
 
     await interaction.response.send_message(
-        "🍬 **Candy Level Role**\n\n"
-        +
-        "\n".join(
-            lines
+        (
+            "🍬 **Candy Level Role**\n\n"
+            +
+            "\n".join(
+                lines
+            )
         ),
         ephemeral=True
     )
@@ -2668,7 +3114,7 @@ async def levelrole_list(
 
 # =========================================================
 # 管理者
-# VOICE時間操作
+# VOICE ADD
 # =========================================================
 
 @bot.tree.command(
@@ -2682,26 +3128,33 @@ async def levelrole_list(
 async def voice_add(
     interaction: discord.Interaction,
     member: discord.Member,
-    hours: app_commands.Range[float, 0.1, 10000.0]
+    hours: app_commands.Range[
+        float,
+        0.1,
+        10000.0
+    ]
 ):
 
     if not await require_admin(
         interaction
     ):
+
         return
+
+    currently_counting = (
+        member.voice is not None
+        and
+        member.voice.channel is not None
+        and
+        is_countable_voice_channel(
+            member.guild,
+            member.voice.channel
+        )
+    )
 
     await flush_voice_session(
         member.id,
-        (
-            member.voice is not None
-            and
-            member.voice.channel is not None
-            and
-            is_countable_voice_channel(
-                member.guild,
-                member.voice.channel
-            )
-        )
+        currently_counting
     )
 
     db_add_voice_seconds(
@@ -2709,15 +3162,31 @@ async def voice_add(
         hours * 3600
     )
 
+    # 高くなった最高到達Lvを保存
+    get_member_levels(
+        member.id,
+        save_peak=True
+    )
+
     await sync_level_roles(
         member
     )
 
     await interaction.response.send_message(
-        f"✅ {member.mention} にVC **{hours:g}時間**追加しました。",
+        (
+            f"✅ {member.mention} にVC "
+            f"**{hours:g}時間**追加しました。"
+        ),
         ephemeral=True
     )
 
+
+# =========================================================
+# 管理者
+# VOICE REMOVE
+#
+# ★ 管理者操作なのでレベルを下げることを許可
+# =========================================================
 
 @bot.tree.command(
     name="voice_remove",
@@ -2730,40 +3199,56 @@ async def voice_add(
 async def voice_remove(
     interaction: discord.Interaction,
     member: discord.Member,
-    hours: app_commands.Range[float, 0.1, 10000.0]
+    hours: app_commands.Range[
+        float,
+        0.1,
+        10000.0
+    ]
 ):
 
     if not await require_admin(
         interaction
     ):
+
         return
 
-    await flush_voice_session(
-        member.id,
-        (
-            member.voice is not None
-            and
-            member.voice.channel is not None
-            and
-            is_countable_voice_channel(
-                member.guild,
-                member.voice.channel
-            )
+    currently_counting = (
+        member.voice is not None
+        and
+        member.voice.channel is not None
+        and
+        is_countable_voice_channel(
+            member.guild,
+            member.voice.channel
         )
     )
 
-    current = db_get_voice_seconds(
-        member.id
+    await flush_voice_session(
+        member.id,
+        currently_counting
+    )
+
+    current = (
+        db_get_voice_seconds(
+            member.id
+        )
+    )
+
+    new_seconds = max(
+        0.0,
+        current
+        -
+        hours * 3600
     )
 
     db_set_voice_seconds(
         member.id,
-        max(
-            0,
-            current
-            -
-            hours * 3600
-        )
+        new_seconds
+    )
+
+    # ★ 管理者操作なので最高Lvも現在値へ変更
+    force_current_levels_as_peak(
+        member.id
     )
 
     await sync_level_roles(
@@ -2771,14 +3256,17 @@ async def voice_remove(
     )
 
     await interaction.response.send_message(
-        f"✅ {member.mention} のVC時間を **{hours:g}時間**減らしました。",
+        (
+            f"✅ {member.mention} のVC時間を "
+            f"**{hours:g}時間**減らしました。"
+        ),
         ephemeral=True
     )
 
 
 # =========================================================
 # 管理者
-# TEXT XP
+# TEXT XP ADD
 # =========================================================
 
 @bot.tree.command(
@@ -2792,12 +3280,17 @@ async def voice_remove(
 async def textxp_add(
     interaction: discord.Interaction,
     member: discord.Member,
-    xp: app_commands.Range[int, 1, 1000000]
+    xp: app_commands.Range[
+        int,
+        1,
+        1000000
+    ]
 ):
 
     if not await require_admin(
         interaction
     ):
+
         return
 
     db_add_text_xp(
@@ -2805,15 +3298,30 @@ async def textxp_add(
         xp
     )
 
+    get_member_levels(
+        member.id,
+        save_peak=True
+    )
+
     await sync_level_roles(
         member
     )
 
     await interaction.response.send_message(
-        f"✅ {member.mention} に **{xp} Text XP**追加しました。",
+        (
+            f"✅ {member.mention} に "
+            f"**{xp} Text XP**追加しました。"
+        ),
         ephemeral=True
     )
 
+
+# =========================================================
+# 管理者
+# TEXT XP REMOVE
+#
+# ★ 管理者操作なのでレベル低下を許可
+# =========================================================
 
 @bot.tree.command(
     name="textxp_remove",
@@ -2826,24 +3334,40 @@ async def textxp_add(
 async def textxp_remove(
     interaction: discord.Interaction,
     member: discord.Member,
-    xp: app_commands.Range[int, 1, 1000000]
+    xp: app_commands.Range[
+        int,
+        1,
+        1000000
+    ]
 ):
 
     if not await require_admin(
         interaction
     ):
+
         return
 
-    current = db_get_text_xp(
-        member.id
+    current = (
+        db_get_text_xp(
+            member.id
+        )
+    )
+
+    new_xp = max(
+        0,
+        current
+        -
+        xp
     )
 
     db_set_text_xp(
         member.id,
-        max(
-            0,
-            current - xp
-        )
+        new_xp
+    )
+
+    # ★ 管理者操作なので最高Lvも下げる
+    force_current_levels_as_peak(
+        member.id
     )
 
     await sync_level_roles(
@@ -2851,7 +3375,10 @@ async def textxp_remove(
     )
 
     await interaction.response.send_message(
-        f"✅ {member.mention} から **{xp} Text XP**減らしました。",
+        (
+            f"✅ {member.mention} から "
+            f"**{xp} Text XP**減らしました。"
+        ),
         ephemeral=True
     )
 
@@ -2877,6 +3404,7 @@ async def levelinfo(
     if not await require_admin(
         interaction
     ):
+
         return
 
     (
@@ -2886,17 +3414,36 @@ async def levelinfo(
         text_level,
         total_level
     ) = get_member_levels(
+        member.id,
+        save_peak=True
+    )
+
+    (
+        peak_voice,
+        peak_text,
+        peak_total
+    ) = db_get_peaks(
         member.id
     )
 
     await interaction.response.send_message(
         (
             f"🍬 **{member.display_name}**\n\n"
+
             f"⭐ Total Level：**{total_level}**\n"
             f"🎤 Voice Level：**{voice_level}**\n"
-            f"🎤 VC累計：**{format_duration(voice_seconds)}**\n"
-            f"💬 Text Level：**{text_level}**\n"
-            f"💬 Text XP：**{text_xp}**"
+            f"💬 Text Level：**{text_level}**\n\n"
+
+            f"🎤 VC累計："
+            f"**{format_duration(voice_seconds)}**\n"
+
+            f"💬 Text XP："
+            f"**{text_xp}**\n\n"
+
+            f"🔒 保存済み最高Lv\n"
+            f"Voice：**{peak_voice}**\n"
+            f"Text：**{peak_text}**\n"
+            f"Total：**{peak_total}**"
         ),
         ephemeral=True
     )
@@ -2904,7 +3451,7 @@ async def levelinfo(
 
 # =========================================================
 # 管理者
-# RESET
+# LEVEL RESET
 # =========================================================
 
 @bot.tree.command(
@@ -2923,6 +3470,7 @@ async def level_reset(
     if not await require_admin(
         interaction
     ):
+
         return
 
     await flush_voice_session(
@@ -2938,6 +3486,16 @@ async def level_reset(
     db_set_text_xp(
         member.id,
         0
+    )
+
+    # 初期状態
+    # Voice 1 + Text 1 = Total 2
+
+    db_force_peak_levels(
+        member.id,
+        1,
+        1,
+        2
     )
 
     if (
@@ -2960,7 +3518,11 @@ async def level_reset(
     )
 
     await interaction.response.send_message(
-        f"✅ {member.mention} のレベル情報をリセットしました。",
+        (
+            f"✅ {member.mention} の"
+            "Voice / Textレベルを"
+            "完全リセットしました。"
+        ),
         ephemeral=True
     )
 
@@ -2971,9 +3533,9 @@ async def level_reset(
 
 @bot.event
 async def on_voice_state_update(
-    member,
-    before,
-    after
+    member: discord.Member,
+    before: discord.VoiceState,
+    after: discord.VoiceState
 ):
 
     if member.bot:
@@ -2998,6 +3560,10 @@ async def on_voice_state_update(
         )
     )
 
+    # -----------------------------------------
+    # 普通VCへ入室
+    # -----------------------------------------
+
     if (
         not before_countable
         and
@@ -3007,6 +3573,10 @@ async def on_voice_state_update(
         start_voice_session(
             member
         )
+
+    # -----------------------------------------
+    # 普通VCから退出 / AFKへ
+    # -----------------------------------------
 
     elif (
         before_countable
@@ -3023,8 +3593,23 @@ async def on_voice_state_update(
             member
         )
 
-    if before.channel == after.channel:
+    # -----------------------------------------
+    # 同じVC内でミュート等だけ変化
+    #
+    # VC時間は止まりません。
+    # -----------------------------------------
+
+    if (
+        before.channel
+        ==
+        after.channel
+    ):
+
         return
+
+    # -----------------------------------------
+    # プロフィール処理
+    # -----------------------------------------
 
     old_task = profile_tasks.pop(
         member.id,
@@ -3036,9 +3621,12 @@ async def on_voice_state_update(
         old_task.cancel()
 
         try:
+
             await old_task
+
         except asyncio.CancelledError:
             pass
+
         except Exception:
             pass
 
@@ -3070,11 +3658,13 @@ async def on_voice_state_update(
 
 # =========================================================
 # MESSAGE
+#
+# プロフィールキャッシュ + Text XP
 # =========================================================
 
 @bot.event
 async def on_message(
-    message
+    message: discord.Message
 ):
 
     if message.author.bot:
@@ -3086,6 +3676,10 @@ async def on_message(
     if message.guild.id != GUILD_ID:
         return
 
+    # -----------------------------------------
+    # プロフィールキャッシュ
+    # -----------------------------------------
+
     if message.channel.id in {
         MALE_PROFILE_CHANNEL_ID,
         FEMALE_PROFILE_CHANNEL_ID
@@ -3094,6 +3688,10 @@ async def on_message(
         profile_cache[
             message.author.id
         ] = message
+
+    # -----------------------------------------
+    # Text XP
+    # -----------------------------------------
 
     content = (
         message.content
@@ -3137,6 +3735,12 @@ async def on_message(
                 user_id
             ] = now
 
+            # ★ レベル最高値保存
+            get_member_levels(
+                user_id,
+                save_peak=True
+            )
+
             try:
 
                 await sync_level_roles(
@@ -3160,7 +3764,7 @@ async def on_message(
 
 @bot.event
 async def on_raw_message_delete(
-    payload
+    payload: discord.RawMessageDeleteEvent
 ):
 
     if payload.guild_id != GUILD_ID:
@@ -3170,13 +3774,18 @@ async def on_raw_message_delete(
         MALE_PROFILE_CHANNEL_ID,
         FEMALE_PROFILE_CHANNEL_ID
     }:
+
         return
 
     remove = []
 
     for user_id, message in profile_cache.items():
 
-        if message.id == payload.message_id:
+        if (
+            message.id
+            ==
+            payload.message_id
+        ):
 
             remove.append(
                 user_id
@@ -3196,7 +3805,7 @@ async def on_raw_message_delete(
 
 @bot.event
 async def on_member_join(
-    member
+    member: discord.Member
 ):
 
     if member.guild.id != GUILD_ID:
@@ -3204,6 +3813,14 @@ async def on_member_join(
 
     if member.bot:
         return
+
+    # 初期最高Lv作成
+    db_save_peak_levels(
+        member.id,
+        1,
+        1,
+        2
+    )
 
     await sync_level_roles(
         member
@@ -3234,6 +3851,10 @@ async def on_ready():
 
         return
 
+    # -----------------------------------------
+    # Slash同期
+    # -----------------------------------------
+
     if not synced_once:
 
         try:
@@ -3255,12 +3876,17 @@ async def on_ready():
                 "Slash同期失敗"
             )
 
+    # -----------------------------------------
+    # 起動時すでにVCにいるメンバー
+    # -----------------------------------------
+
     for channel in guild.voice_channels:
 
         if not is_countable_voice_channel(
             guild,
             channel
         ):
+
             continue
 
         for member in channel.members:
@@ -3271,6 +3897,10 @@ async def on_ready():
             start_voice_session(
                 member
             )
+
+    # -----------------------------------------
+    # 1分保存
+    # -----------------------------------------
 
     if not voice_save_loop.is_running():
 
@@ -3301,7 +3931,15 @@ async def on_ready():
     )
 
     log.info(
-        "🎤 Voice Lv5 = 10時間"
+        "🔒 レベル低下防止: ON"
+    )
+
+    log.info(
+        "💾 最高到達レベル保存: ON"
+    )
+
+    log.info(
+        "🎤 Voice Lv5 = 累計10時間"
     )
 
     log.info(
@@ -3317,12 +3955,17 @@ async def on_ready():
     )
 
     log.info(
-        "💬 Text XP cooldown = %s秒",
+        "💬 TC cooldown = %s秒",
         TEXT_XP_COOLDOWN
     )
 
     log.info(
         "🖼️ 個人背景 = ON"
+    )
+
+    log.info(
+        "Database: %s",
+        DB_PATH
     )
 
     log.info(
