@@ -13,49 +13,77 @@ from threading import Thread
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 
 
 # =========================================================
 # 🍬 Candy
-# VCプロフィール ＋ レベルBot 完全統合版
+# VCプロフィール + Voice/Text/Total Level Bot
 # =========================================================
 
 TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 
-# ---------------------------------------------------------
-# Candy サーバー
-# ---------------------------------------------------------
+# =========================================================
+# Candy サーバー設定
+# =========================================================
 
 GUILD_ID = 1542420058775494666
 
-# 管理者ロール
 ADMIN_ROLE_ID = 1542422448895565824
 
-# プロフィールチャンネル
 MALE_PROFILE_CHANNEL_ID = 1542429626905657415
 FEMALE_PROFILE_CHANNEL_ID = 1542429755750486026
 
-# しゃべレア移動待ち
 PROFILE_DELAY = 5
-
-# 二重チェック
 DUPLICATE_CHECK_LIMIT = 20
 
-# ---------------------------------------------------------
-# SQLite
-# Render Persistent Disk を使う場合は
-# DATABASE_PATH=/var/data/candy_level.db
-# にするのがおすすめ
-# ---------------------------------------------------------
+
+# =========================================================
+# Text XP
+# =========================================================
+
+# 同一人物がXPを獲得できる間隔
+TEXT_XP_COOLDOWN = 60
+
+# これ未満の文字数はXPなし
+TEXT_MIN_LENGTH = 3
+
+# 1投稿のXP
+TEXT_XP_PER_MESSAGE = 1
+
+
+# =========================================================
+# DATABASE
+# =========================================================
 
 DB_PATH = os.getenv(
     "DATABASE_PATH",
     "data/candy_level.db"
 )
 
+DATA_DIR = Path(DB_PATH).parent
+
+BACKGROUND_DIR = (
+    DATA_DIR
+    /
+    "level_backgrounds"
+)
+
+DATA_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+BACKGROUND_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+
+# =========================================================
 # Render
+# =========================================================
+
 PORT = int(
     os.getenv(
         "PORT",
@@ -74,19 +102,13 @@ logging.basicConfig(
 )
 
 log = logging.getLogger(
-    "candy-bot"
+    "candy-level-profile"
 )
 
 
 # =========================================================
 # DATABASE
 # =========================================================
-
-Path(DB_PATH).parent.mkdir(
-    parents=True,
-    exist_ok=True
-)
-
 
 def db_connect():
 
@@ -104,7 +126,7 @@ def init_database():
     with db_connect() as conn:
 
         # -----------------------------------------
-        # VC滞在時間
+        # VC累計
         # -----------------------------------------
 
         conn.execute(
@@ -117,14 +139,20 @@ def init_database():
         )
 
         # -----------------------------------------
+        # TC XP
+        # -----------------------------------------
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS text_stats (
+                user_id INTEGER PRIMARY KEY,
+                total_xp INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+
+        # -----------------------------------------
         # レベルロール
-        #
-        # level = そのロールになる開始Lv
-        #
-        # 例
-        # Lv1  Candy新人
-        # Lv5  Candy常連
-        # Lv20 CandyVIP
         # -----------------------------------------
 
         conn.execute(
@@ -143,10 +171,10 @@ init_database()
 
 
 # =========================================================
-# DB - VC時間
+# VC DB
 # =========================================================
 
-def db_get_seconds(
+def db_get_voice_seconds(
     user_id: int
 ) -> float:
 
@@ -158,9 +186,7 @@ def db_get_seconds(
             FROM voice_stats
             WHERE user_id = ?
             """,
-            (
-                user_id,
-            )
+            (user_id,)
         ).fetchone()
 
     if row is None:
@@ -171,7 +197,7 @@ def db_get_seconds(
     )
 
 
-def db_set_seconds(
+def db_set_voice_seconds(
     user_id: int,
     seconds: float
 ):
@@ -204,7 +230,7 @@ def db_set_seconds(
         conn.commit()
 
 
-def db_add_seconds(
+def db_add_voice_seconds(
     user_id: int,
     seconds: float
 ):
@@ -239,7 +265,101 @@ def db_add_seconds(
 
 
 # =========================================================
-# DB - レベルロール
+# TEXT DB
+# =========================================================
+
+def db_get_text_xp(
+    user_id: int
+) -> int:
+
+    with db_connect() as conn:
+
+        row = conn.execute(
+            """
+            SELECT total_xp
+            FROM text_stats
+            WHERE user_id = ?
+            """,
+            (user_id,)
+        ).fetchone()
+
+    if row is None:
+        return 0
+
+    return int(
+        row["total_xp"]
+    )
+
+
+def db_set_text_xp(
+    user_id: int,
+    xp: int
+):
+
+    xp = max(
+        0,
+        int(xp)
+    )
+
+    with db_connect() as conn:
+
+        conn.execute(
+            """
+            INSERT INTO text_stats (
+                user_id,
+                total_xp
+            )
+            VALUES (?, ?)
+
+            ON CONFLICT(user_id)
+            DO UPDATE SET
+                total_xp = excluded.total_xp
+            """,
+            (
+                user_id,
+                xp
+            )
+        )
+
+        conn.commit()
+
+
+def db_add_text_xp(
+    user_id: int,
+    xp: int
+):
+
+    if xp <= 0:
+        return
+
+    with db_connect() as conn:
+
+        conn.execute(
+            """
+            INSERT INTO text_stats (
+                user_id,
+                total_xp
+            )
+            VALUES (?, ?)
+
+            ON CONFLICT(user_id)
+            DO UPDATE SET
+                total_xp =
+                    text_stats.total_xp
+                    +
+                    excluded.total_xp
+            """,
+            (
+                user_id,
+                xp
+            )
+        )
+
+        conn.commit()
+
+
+# =========================================================
+# レベルロール DB
 # =========================================================
 
 def db_set_level_role(
@@ -281,9 +401,7 @@ def db_remove_level_role(
             DELETE FROM level_roles
             WHERE level = ?
             """,
-            (
-                level,
-            )
+            (level,)
         )
 
         conn.commit()
@@ -293,7 +411,7 @@ def db_get_level_roles():
 
     with db_connect() as conn:
 
-        rows = conn.execute(
+        return conn.execute(
             """
             SELECT level, role_id
             FROM level_roles
@@ -301,26 +419,16 @@ def db_get_level_roles():
             """
         ).fetchall()
 
-    return rows
-
 
 # =========================================================
-# LEVEL SYSTEM
+# VOICE LEVEL
+#
+# Lv5 = 累計10時間
 # =========================================================
 
-def required_hours_for_level(
+def voice_required_hours(
     level: int
 ) -> float:
-
-    """
-    Lv1 = 0時間
-    Lv2 = 1時間
-    Lv3 = 2.5時間
-    Lv4 = 5時間
-    Lv5 = 10時間
-
-    Lv5以降は徐々に重くなる
-    """
 
     if level <= 1:
         return 0.0
@@ -329,19 +437,11 @@ def required_hours_for_level(
         2: 1.0,
         3: 2.5,
         4: 5.0,
-        5: 10.0
+        5: 10.0,
     }
 
     if level in fixed:
         return fixed[level]
-
-    # -----------------------------------------
-    # Lv5以降
-    #
-    # Lv10 約31時間
-    # Lv20 約96時間
-    # 高レベルになるほど必要時間増加
-    # -----------------------------------------
 
     n = level - 5
 
@@ -354,38 +454,35 @@ def required_hours_for_level(
     )
 
 
-def required_seconds_for_level(
+def voice_required_seconds(
     level: int
 ) -> float:
 
     return (
-        required_hours_for_level(
-            level
-        )
+        voice_required_hours(level)
         *
         3600
     )
 
 
-def calculate_level(
-    total_seconds: float
+def calculate_voice_level(
+    seconds: float
 ) -> int:
 
     level = 1
 
-    # 上限1000
     for next_level in range(
         2,
         1001
     ):
 
-        required = (
-            required_seconds_for_level(
+        if (
+            seconds
+            <
+            voice_required_seconds(
                 next_level
             )
-        )
-
-        if total_seconds < required:
+        ):
             break
 
         level = next_level
@@ -393,35 +490,35 @@ def calculate_level(
     return level
 
 
-def get_level_progress(
-    total_seconds: float
+def voice_progress(
+    seconds: float
 ):
 
-    level = calculate_level(
-        total_seconds
+    level = calculate_voice_level(
+        seconds
     )
 
     current_required = (
-        required_seconds_for_level(
+        voice_required_seconds(
             level
         )
     )
 
     next_required = (
-        required_seconds_for_level(
+        voice_required_seconds(
             level + 1
         )
     )
 
-    progress_seconds = max(
-        0.0,
-        total_seconds
+    current = max(
+        0,
+        seconds
         -
         current_required
     )
 
-    needed_seconds = max(
-        1.0,
+    needed = max(
+        1,
         next_required
         -
         current_required
@@ -429,17 +526,139 @@ def get_level_progress(
 
     percent = min(
         1.0,
-        progress_seconds
+        current
         /
-        needed_seconds
+        needed
     )
 
     return (
         level,
-        progress_seconds,
-        needed_seconds,
-        percent,
+        current,
+        needed,
+        percent
+    )
+
+
+# =========================================================
+# TEXT LEVEL
+#
+# Lv5 = 300有効メッセージ相当
+#
+# 60秒クールタイムなので
+# 連投だけで一気に上げにくい設定
+# =========================================================
+
+def text_required_xp(
+    level: int
+) -> int:
+
+    if level <= 1:
+        return 0
+
+    fixed = {
+        2: 30,
+        3: 90,
+        4: 180,
+        5: 300,
+    }
+
+    if level in fixed:
+        return fixed[level]
+
+    n = level - 5
+
+    return int(
+        300
+        +
+        100 * n
+        +
+        15 * (n ** 2)
+    )
+
+
+def calculate_text_level(
+    xp: int
+) -> int:
+
+    level = 1
+
+    for next_level in range(
+        2,
+        1001
+    ):
+
+        if xp < text_required_xp(
+            next_level
+        ):
+            break
+
+        level = next_level
+
+    return level
+
+
+def text_progress(
+    xp: int
+):
+
+    level = calculate_text_level(
+        xp
+    )
+
+    current_required = (
+        text_required_xp(
+            level
+        )
+    )
+
+    next_required = (
+        text_required_xp(
+            level + 1
+        )
+    )
+
+    current = max(
+        0,
+        xp
+        -
+        current_required
+    )
+
+    needed = max(
+        1,
         next_required
+        -
+        current_required
+    )
+
+    percent = min(
+        1.0,
+        current
+        /
+        needed
+    )
+
+    return (
+        level,
+        current,
+        needed,
+        percent
+    )
+
+
+# =========================================================
+# TOTAL LEVEL
+# =========================================================
+
+def calculate_total_level(
+    voice_level: int,
+    text_level: int
+) -> int:
+
+    return (
+        voice_level
+        +
+        text_level
     )
 
 
@@ -449,17 +668,23 @@ def get_level_progress(
 
 def format_duration(
     seconds: float
-) -> str:
+):
 
     seconds = max(
         0,
         int(seconds)
     )
 
-    hours = seconds // 3600
+    hours = (
+        seconds
+        //
+        3600
+    )
 
     minutes = (
-        seconds % 3600
+        seconds
+        %
+        3600
     ) // 60
 
     return (
@@ -510,7 +735,7 @@ def start_web_server():
         ).start()
 
         log.info(
-            "Health server started on port %s",
+            "Health server started: %s",
             PORT
         )
 
@@ -544,37 +769,17 @@ GUILD_OBJECT = discord.Object(
 
 
 # =========================================================
-# プロフィール用保存
+# メモリ
 # =========================================================
 
-profile_tasks: dict[
-    int,
-    asyncio.Task
-] = {}
+profile_tasks = {}
+profile_messages = {}
+profile_cache = {}
 
+voice_sessions = {}
 
-profile_messages: dict[
-    int,
-    dict
-] = {}
-
-
-profile_cache: dict[
-    int,
-    discord.Message
-] = {}
-
-
-# =========================================================
-# VCレベル用
-#
-# user_id : 計測開始時刻
-# =========================================================
-
-voice_sessions: dict[
-    int,
-    float
-] = {}
+# TEXT XPクールタイム
+text_xp_cooldowns = {}
 
 
 # =========================================================
@@ -583,7 +788,7 @@ voice_sessions: dict[
 
 def is_admin_member(
     member: discord.Member
-) -> bool:
+):
 
     if member.guild_permissions.administrator:
         return True
@@ -596,30 +801,28 @@ def is_admin_member(
 
 async def require_admin(
     interaction: discord.Interaction
-) -> bool:
-
-    member = interaction.user
+):
 
     if not isinstance(
-        member,
+        interaction.user,
         discord.Member
     ):
 
         await interaction.response.send_message(
-            "❌ このコマンドはサーバー内でのみ使えます。",
+            "❌ サーバー内で使用してください。",
             ephemeral=True
         )
 
         return False
 
     if is_admin_member(
-        member
+        interaction.user
     ):
 
         return True
 
     await interaction.response.send_message(
-        "❌ このコマンドは管理者専用です。",
+        "❌ 管理者専用コマンドです。",
         ephemeral=True
     )
 
@@ -627,24 +830,24 @@ async def require_admin(
 
 
 # =========================================================
-# VCがレベル対象か
+# VC加算対象判定
 # =========================================================
 
 def is_countable_voice_channel(
     guild: discord.Guild,
-    channel: discord.abc.GuildChannel | None
-) -> bool:
+    channel
+):
 
     if channel is None:
         return False
 
-    # AFKチャンネルは対象外
+    # AFKチャンネル除外
     if (
         guild.afk_channel
         and
-        channel.id
-        ==
         guild.afk_channel.id
+        ==
+        channel.id
     ):
         return False
 
@@ -652,7 +855,7 @@ def is_countable_voice_channel(
 
 
 # =========================================================
-# VCセッション開始
+# VC SESSION
 # =========================================================
 
 def start_voice_session(
@@ -662,11 +865,7 @@ def start_voice_session(
     if member.bot:
         return
 
-    if (
-        member.id
-        in
-        voice_sessions
-    ):
+    if member.id in voice_sessions:
         return
 
     voice_sessions[
@@ -674,37 +873,33 @@ def start_voice_session(
     ] = time.time()
 
     log.info(
-        "⏱️ VC計測開始: %s",
+        "🎤 VC計測開始: %s",
         member
     )
 
 
-# =========================================================
-# VCセッション保存
-# =========================================================
-
 async def flush_voice_session(
     user_id: int,
-    keep_running: bool = True
+    keep_running=True
 ):
 
-    started_at = voice_sessions.get(
+    started = voice_sessions.get(
         user_id
     )
 
-    if started_at is None:
+    if started is None:
         return
 
     now = time.time()
 
     elapsed = max(
-        0.0,
-        now - started_at
+        0,
+        now - started
     )
 
     if elapsed > 0:
 
-        db_add_seconds(
+        db_add_voice_seconds(
             user_id,
             elapsed
         )
@@ -723,53 +918,97 @@ async def flush_voice_session(
         )
 
 
-# =========================================================
-# 現在の合計VC時間
-# =========================================================
-
-def get_live_total_seconds(
+def get_live_voice_seconds(
     user_id: int
-) -> float:
+):
 
-    total = db_get_seconds(
+    total = db_get_voice_seconds(
         user_id
     )
 
-    started_at = voice_sessions.get(
+    started = voice_sessions.get(
         user_id
     )
 
-    if started_at is not None:
+    if started:
 
         total += max(
-            0.0,
+            0,
             time.time()
             -
-            started_at
+            started
         )
 
     return total
 
 
 # =========================================================
-# 現在適用するレベルロール
+# TOTAL LEVEL取得
+# =========================================================
+
+def get_member_levels(
+    user_id: int
+):
+
+    voice_seconds = (
+        get_live_voice_seconds(
+            user_id
+        )
+    )
+
+    text_xp = db_get_text_xp(
+        user_id
+    )
+
+    voice_level = (
+        calculate_voice_level(
+            voice_seconds
+        )
+    )
+
+    text_level = (
+        calculate_text_level(
+            text_xp
+        )
+    )
+
+    total_level = (
+        calculate_total_level(
+            voice_level,
+            text_level
+        )
+    )
+
+    return (
+        voice_seconds,
+        text_xp,
+        voice_level,
+        text_level,
+        total_level
+    )
+
+
+# =========================================================
+# LEVEL ROLE
 # =========================================================
 
 def get_target_level_role_id(
-    level: int
+    total_level: int
 ):
-
-    rows = db_get_level_roles()
 
     target = None
 
-    for row in rows:
+    for row in db_get_level_roles():
 
         required_level = int(
             row["level"]
         )
 
-        if level >= required_level:
+        if (
+            total_level
+            >=
+            required_level
+        ):
 
             target = int(
                 row["role_id"]
@@ -782,10 +1021,6 @@ def get_target_level_role_id(
     return target
 
 
-# =========================================================
-# レベルロール同期
-# =========================================================
-
 async def sync_level_roles(
     member: discord.Member
 ):
@@ -793,14 +1028,14 @@ async def sync_level_roles(
     if member.bot:
         return
 
-    total_seconds = (
-        get_live_total_seconds(
-            member.id
-        )
-    )
-
-    level = calculate_level(
-        total_seconds
+    (
+        voice_seconds,
+        text_xp,
+        voice_level,
+        text_level,
+        total_level
+    ) = get_member_levels(
+        member.id
     )
 
     settings = db_get_level_roles()
@@ -808,55 +1043,48 @@ async def sync_level_roles(
     if not settings:
         return
 
-    configured_role_ids = {
+    configured_ids = {
         int(row["role_id"])
         for row in settings
     }
 
     target_role_id = (
         get_target_level_role_id(
-            level
+            total_level
         )
     )
 
-    roles_to_remove = []
+    remove_roles = []
 
     for role in member.roles:
 
         if (
             role.id
             in
-            configured_role_ids
+            configured_ids
             and
             role.id
             !=
             target_role_id
         ):
 
-            roles_to_remove.append(
+            remove_roles.append(
                 role
             )
 
     try:
 
-        if roles_to_remove:
+        if remove_roles:
 
             await member.remove_roles(
-                *roles_to_remove,
-                reason="Candy レベルロール自動更新"
+                *remove_roles,
+                reason="Candy レベルランク更新"
             )
-
-    except discord.Forbidden:
-
-        log.warning(
-            "レベルロール削除権限なし: %s",
-            member
-        )
 
     except Exception:
 
         log.exception(
-            "レベルロール削除エラー"
+            "ランクロール削除失敗"
         )
 
     if target_role_id is None:
@@ -878,72 +1106,33 @@ async def sync_level_roles(
 
         await member.add_roles(
             target_role,
-            reason=f"Candy Lv{level} 到達"
+            reason=(
+                f"Candy Total Lv."
+                f"{total_level}"
+            )
         )
 
         log.info(
-            "🍬 レベルロール付与: %s -> %s",
+            "🍬 ランク更新: %s → %s",
             member,
-            target_role.name
-        )
-
-    except discord.Forbidden:
-
-        log.warning(
-            "レベルロール付与権限なし: %s",
             target_role.name
         )
 
     except Exception:
 
         log.exception(
-            "レベルロール付与エラー"
+            "ランクロール付与失敗"
         )
 
 
 # =========================================================
-# 全員ロール再同期
-# =========================================================
-
-async def sync_all_level_roles(
-    guild: discord.Guild
-):
-
-    for member in guild.members:
-
-        if member.bot:
-            continue
-
-        try:
-
-            await sync_level_roles(
-                member
-            )
-
-        except Exception:
-
-            log.exception(
-                "全員ロール同期エラー: %s",
-                member
-            )
-
-        # API負荷を軽減
-        await asyncio.sleep(
-            0.15
-        )
-
-
-# =========================================================
-# 1分ごとにVC時間保存
-#
-# これによりRenderが落ちても
-# 最大約1分程度のロスで済む
+# 1分ごと VC保存
 # =========================================================
 
 @tasks.loop(
     seconds=60
 )
-async def level_flush_loop():
+async def voice_save_loop():
 
     guild = bot.get_guild(
         GUILD_ID
@@ -952,11 +1141,9 @@ async def level_flush_loop():
     if guild is None:
         return
 
-    user_ids = list(
+    for user_id in list(
         voice_sessions.keys()
-    )
-
-    for user_id in user_ids:
+    ):
 
         member = guild.get_member(
             user_id
@@ -966,12 +1153,11 @@ async def level_flush_loop():
 
             await flush_voice_session(
                 user_id,
-                keep_running=False
+                False
             )
 
             continue
 
-        # VCから消えていた場合
         if (
             member.voice is None
             or
@@ -980,7 +1166,7 @@ async def level_flush_loop():
 
             await flush_voice_session(
                 user_id,
-                keep_running=False
+                False
             )
 
             await sync_level_roles(
@@ -989,7 +1175,6 @@ async def level_flush_loop():
 
             continue
 
-        # AFKに移動していた場合
         if not is_countable_voice_channel(
             guild,
             member.voice.channel
@@ -997,18 +1182,14 @@ async def level_flush_loop():
 
             await flush_voice_session(
                 user_id,
-                keep_running=False
-            )
-
-            await sync_level_roles(
-                member
+                False
             )
 
             continue
 
         await flush_voice_session(
             user_id,
-            keep_running=True
+            True
         )
 
         await sync_level_roles(
@@ -1016,8 +1197,8 @@ async def level_flush_loop():
         )
 
 
-@level_flush_loop.before_loop
-async def before_level_flush():
+@voice_save_loop.before_loop
+async def before_voice_save_loop():
 
     await bot.wait_until_ready()
 
@@ -1032,7 +1213,7 @@ class ProfileView(
 
     def __init__(
         self,
-        url: str
+        url
     ):
 
         super().__init__(
@@ -1054,25 +1235,25 @@ class ProfileView(
 # =========================================================
 
 async def find_profile_message(
-    member: discord.Member
+    member
 ):
 
     cached = profile_cache.get(
         member.id
     )
 
-    if cached is not None:
+    if cached:
         return cached
-
-    guild = member.guild
 
     for channel_id in [
         MALE_PROFILE_CHANNEL_ID,
         FEMALE_PROFILE_CHANNEL_ID
     ]:
 
-        channel = guild.get_channel(
-            channel_id
+        channel = (
+            member.guild.get_channel(
+                channel_id
+            )
         )
 
         if channel is None:
@@ -1081,8 +1262,7 @@ async def find_profile_message(
         try:
 
             async for message in channel.history(
-                limit=None,
-                oldest_first=False
+                limit=None
             ):
 
                 if (
@@ -1102,26 +1282,23 @@ async def find_profile_message(
         except Exception:
 
             log.exception(
-                "プロフィール検索エラー"
+                "プロフィール検索失敗"
             )
 
     return None
 
 
 # =========================================================
-# 直近履歴に同じプロフィールがあるか
+# プロフィール二重チェック
 # =========================================================
 
 async def profile_already_exists(
-    channel: discord.VoiceChannel,
-    user_id: int
+    channel,
+    user_id
 ):
 
-    target_text = (
-        f"ID:{user_id}"
-    )
-
-    target_text_space = (
+    targets = (
+        f"ID:{user_id}",
         f"ID: {user_id}"
     )
 
@@ -1147,54 +1324,39 @@ async def profile_already_exists(
                     ""
                 )
 
-                if (
-                    target_text
-                    in description
-                    or
-                    target_text_space
-                    in description
+                if any(
+                    x in description
+                    for x in targets
                 ):
 
                     return message
 
-            content = (
-                message.content
-                or
-                ""
-            )
-
-            if (
-                target_text
-                in content
-                or
-                target_text_space
-                in content
+            if any(
+                x in (
+                    message.content
+                    or
+                    ""
+                )
+                for x in targets
             ):
 
                 return message
 
-    except discord.Forbidden:
-
-        log.warning(
-            "履歴確認権限なし: %s",
-            channel.id
-        )
-
     except Exception:
 
         log.exception(
-            "二重投稿チェックエラー"
+            "プロフィール二重確認失敗"
         )
 
     return None
 
 
 # =========================================================
-# 表示中プロフィール削除
+# プロフィール削除
 # =========================================================
 
 async def delete_profile_card(
-    member: discord.Member
+    member
 ):
 
     data = profile_messages.pop(
@@ -1205,11 +1367,13 @@ async def delete_profile_card(
     if not data:
         return
 
-    channel = member.guild.get_channel(
-        data["channel_id"]
+    channel = (
+        member.guild.get_channel(
+            data["channel_id"]
+        )
     )
 
-    if channel is None:
+    if not channel:
         return
 
     try:
@@ -1224,26 +1388,16 @@ async def delete_profile_card(
         pass
 
     except Exception:
+        pass
 
-        log.exception(
-            "プロフィール削除エラー"
-        )
-
-
-# =========================================================
-# 履歴からプロフィールカード削除
-# =========================================================
 
 async def delete_profile_cards_from_channel(
-    channel: discord.VoiceChannel,
-    user_id: int
+    channel,
+    user_id
 ):
 
-    target_text = (
-        f"ID:{user_id}"
-    )
-
-    target_text_space = (
+    targets = (
+        f"ID:{user_id}",
         f"ID: {user_id}"
     )
 
@@ -1265,18 +1419,15 @@ async def delete_profile_cards_from_channel(
 
             for embed in message.embeds:
 
-                description = (
+                text = (
                     embed.description
                     or
                     ""
                 )
 
-                if (
-                    target_text
-                    in description
-                    or
-                    target_text_space
-                    in description
+                if any(
+                    x in text
+                    for x in targets
                 ):
 
                     matched = True
@@ -1284,16 +1435,13 @@ async def delete_profile_cards_from_channel(
 
             if not matched:
 
-                content = (
-                    message.content
-                    or
-                    ""
-                )
-
-                if (
-                    target_text in content
-                    or
-                    target_text_space in content
+                if any(
+                    x in (
+                        message.content
+                        or
+                        ""
+                    )
+                    for x in targets
                 ):
 
                     matched = True
@@ -1308,17 +1456,17 @@ async def delete_profile_cards_from_channel(
     except Exception:
 
         log.exception(
-            "履歴プロフィール削除エラー"
+            "履歴プロフィール削除失敗"
         )
 
 
 # =========================================================
-# 5秒後プロフィール表示
+# プロフィール投稿
 # =========================================================
 
 async def delayed_profile_post(
-    member: discord.Member,
-    expected_channel_id: int
+    member,
+    expected_channel_id
 ):
 
     try:
@@ -1329,11 +1477,13 @@ async def delayed_profile_post(
 
         guild = member.guild
 
-        current_member = guild.get_member(
-            member.id
+        current_member = (
+            guild.get_member(
+                member.id
+            )
         )
 
-        if current_member is None:
+        if not current_member:
             return
 
         if (
@@ -1354,24 +1504,11 @@ async def delayed_profile_post(
         ):
             return
 
-        existing = profile_messages.get(
-            current_member.id
-        )
-
-        if (
-            existing
-            and
-            existing.get(
-                "channel_id"
+        duplicate = (
+            await profile_already_exists(
+                current_vc,
+                current_member.id
             )
-            ==
-            current_vc.id
-        ):
-            return
-
-        duplicate = await profile_already_exists(
-            current_vc,
-            current_member.id
         )
 
         if duplicate:
@@ -1387,8 +1524,10 @@ async def delayed_profile_post(
 
             return
 
-        profile_message = await find_profile_message(
-            current_member
+        profile_message = (
+            await find_profile_message(
+                current_member
+            )
         )
 
         if profile_message:
@@ -1417,7 +1556,6 @@ async def delayed_profile_post(
             description=description
         )
 
-        # サーバーアバター優先
         avatar = (
             current_member.guild_avatar
             or
@@ -1432,22 +1570,14 @@ async def delayed_profile_post(
             0.5
         )
 
-        duplicate = await profile_already_exists(
-            current_vc,
-            current_member.id
+        duplicate = (
+            await profile_already_exists(
+                current_vc,
+                current_member.id
+            )
         )
 
         if duplicate:
-
-            profile_messages[
-                current_member.id
-            ] = {
-                "channel_id":
-                    current_vc.id,
-                "message_id":
-                    duplicate.id
-            }
-
             return
 
         if profile_message:
@@ -1474,30 +1604,24 @@ async def delayed_profile_post(
                 sent.id
         }
 
-        log.info(
-            "✅ プロフィール表示: %s -> %s",
-            current_member,
-            current_vc.name
-        )
-
     except asyncio.CancelledError:
         return
 
     except Exception:
 
         log.exception(
-            "プロフィール投稿エラー"
+            "プロフィール投稿失敗"
         )
 
     finally:
 
-        current_task = asyncio.current_task()
+        task = asyncio.current_task()
 
         if (
             profile_tasks.get(
                 member.id
             )
-            is current_task
+            is task
         ):
 
             profile_tasks.pop(
@@ -1511,23 +1635,18 @@ async def delayed_profile_post(
 # =========================================================
 
 def get_font(
-    size: int
+    size
 ):
 
-    font_paths = [
-
+    paths = [
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
-
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-
         "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     ]
 
-    for path in font_paths:
+    for path in paths:
 
         if os.path.exists(
             path
@@ -1547,22 +1666,13 @@ def get_font(
 
 
 # =========================================================
-# LEVEL CARD生成
+# デフォルト背景
 # =========================================================
 
-def make_level_card(
-    avatar_bytes: bytes,
-    display_name: str,
-    level: int,
-    total_seconds: float,
-    progress: float,
-    progress_seconds: float,
-    needed_seconds: float,
-    role_name: str
-) -> io.BytesIO:
-
-    width = 1000
-    height = 360
+def make_default_background(
+    width,
+    height
+):
 
     image = Image.new(
         "RGB",
@@ -1571,9 +1681,9 @@ def make_level_card(
             height
         ),
         (
-            30,
-            22,
-            45
+            52,
+            37,
+            74
         )
     )
 
@@ -1581,37 +1691,11 @@ def make_level_card(
         image
     )
 
-    # -----------------------------------------------------
-    # 背景
-    # -----------------------------------------------------
-
     for y in range(
         height
     ):
 
-        ratio = (
-            y
-            /
-            height
-        )
-
-        r = int(
-            48
-            +
-            35 * ratio
-        )
-
-        g = int(
-            34
-            +
-            20 * ratio
-        )
-
-        b = int(
-            72
-            +
-            38 * ratio
-        )
+        ratio = y / height
 
         draw.line(
             (
@@ -1621,38 +1705,248 @@ def make_level_card(
                 y
             ),
             fill=(
-                r,
-                g,
-                b
+                int(55 + 45 * ratio),
+                int(38 + 25 * ratio),
+                int(80 + 55 * ratio)
             )
         )
 
-    # 飾り
     draw.ellipse(
         (
-            720,
-            -150,
+            680,
+            -180,
             1100,
-            230
+            240
         ),
         fill=(
-            93,
-            69,
-            130
+            125,
+            85,
+            160
         )
     )
 
     draw.ellipse(
         (
-            -120,
+            -170,
             220,
-            260,
-            600
+            270,
+            660
         ),
         fill=(
-            62,
-            46,
-            91
+            85,
+            55,
+            115
+        )
+    )
+
+    return image
+
+
+# =========================================================
+# 背景ファイル
+# =========================================================
+
+def get_background_path(
+    user_id
+):
+
+    return (
+        BACKGROUND_DIR
+        /
+        f"{user_id}.jpg"
+    )
+
+
+# =========================================================
+# 背景画像保存
+# =========================================================
+
+def save_background_image(
+    user_id: int,
+    data: bytes
+):
+
+    image = Image.open(
+        io.BytesIO(
+            data
+        )
+    )
+
+    image = image.convert(
+        "RGB"
+    )
+
+    target_w = 1000
+    target_h = 420
+
+    source_ratio = (
+        image.width
+        /
+        image.height
+    )
+
+    target_ratio = (
+        target_w
+        /
+        target_h
+    )
+
+    if source_ratio > target_ratio:
+
+        new_h = target_h
+
+        new_w = int(
+            new_h
+            *
+            source_ratio
+        )
+
+    else:
+
+        new_w = target_w
+
+        new_h = int(
+            new_w
+            /
+            source_ratio
+        )
+
+    image = image.resize(
+        (
+            new_w,
+            new_h
+        ),
+        Image.Resampling.LANCZOS
+    )
+
+    left = (
+        new_w
+        -
+        target_w
+    ) // 2
+
+    top = (
+        new_h
+        -
+        target_h
+    ) // 2
+
+    image = image.crop(
+        (
+            left,
+            top,
+            left + target_w,
+            top + target_h
+        )
+    )
+
+    path = get_background_path(
+        user_id
+    )
+
+    image.save(
+        path,
+        "JPEG",
+        quality=90
+    )
+
+
+# =========================================================
+# レベルカード
+# =========================================================
+
+def make_level_card(
+    avatar_bytes,
+    display_name,
+    total_level,
+    voice_level,
+    text_level,
+    voice_seconds,
+    text_xp,
+    voice_percent,
+    voice_current,
+    voice_needed,
+    text_percent,
+    text_current,
+    text_needed,
+    role_name,
+    background_path
+):
+
+    width = 1000
+    height = 420
+
+    # -----------------------------------------------------
+    # Background
+    # -----------------------------------------------------
+
+    if (
+        background_path
+        and
+        os.path.exists(
+            background_path
+        )
+    ):
+
+        try:
+
+            image = Image.open(
+                background_path
+            ).convert(
+                "RGB"
+            )
+
+            image = image.resize(
+                (
+                    width,
+                    height
+                )
+            )
+
+        except Exception:
+
+            image = (
+                make_default_background(
+                    width,
+                    height
+                )
+            )
+
+    else:
+
+        image = make_default_background(
+            width,
+            height
+        )
+
+    # 暗くして文字を読みやすく
+    enhancer = ImageEnhance.Brightness(
+        image
+    )
+
+    image = enhancer.enhance(
+        0.58
+    )
+
+    draw = ImageDraw.Draw(
+        image,
+        "RGBA"
+    )
+
+    # カード半透明
+    draw.rounded_rectangle(
+        (
+            25,
+            25,
+            975,
+            395
+        ),
+        radius=30,
+        fill=(
+            15,
+            12,
+            22,
+            125
         )
     )
 
@@ -1672,30 +1966,30 @@ def make_level_card(
 
         avatar = avatar.resize(
             (
-                190,
-                190
+                180,
+                180
             )
         )
 
         mask = Image.new(
             "L",
             (
-                190,
-                190
+                180,
+                180
             ),
             0
         )
 
-        mask_draw = ImageDraw.Draw(
+        md = ImageDraw.Draw(
             mask
         )
 
-        mask_draw.ellipse(
+        md.ellipse(
             (
                 0,
                 0,
-                190,
-                190
+                180,
+                180
             ),
             fill=255
         )
@@ -1704,18 +1998,18 @@ def make_level_card(
             mask
         )
 
-        # 外枠
         draw.ellipse(
             (
                 54,
-                74,
-                256,
-                276
+                79,
+                246,
+                271
             ),
             fill=(
                 255,
                 255,
-                255
+                255,
+                235
             )
         )
 
@@ -1723,7 +2017,7 @@ def make_level_card(
             avatar,
             (
                 60,
-                80
+                85
             ),
             avatar
         )
@@ -1734,76 +2028,76 @@ def make_level_card(
             "Avatar描画失敗"
         )
 
-    # -----------------------------------------------------
-    # Fonts
-    # -----------------------------------------------------
-
-    font_name = get_font(
-        38
-    )
-
-    font_level_small = get_font(
-        24
-    )
-
-    font_level_big = get_font(
-        80
-    )
-
-    font_normal = get_font(
-        25
-    )
-
-    font_small = get_font(
-        20
-    )
+    font_name = get_font(32)
+    font_big = get_font(70)
+    font_medium = get_font(25)
+    font_small = get_font(18)
+    font_tiny = get_font(15)
 
     # -----------------------------------------------------
-    # Name
+    # User
     # -----------------------------------------------------
 
     draw.text(
         (
-            295,
-            54
+            285,
+            45
         ),
-        display_name[:24],
+        display_name[:22],
         font=font_name,
         fill=(
+            255,
             255,
             255,
             255
         )
     )
 
+    if role_name:
+
+        draw.text(
+            (
+                286,
+                89
+            ),
+            f"RANK  {role_name}",
+            font=font_small,
+            fill=(
+                239,
+                218,
+                255,
+                255
+            )
+        )
+
     # -----------------------------------------------------
-    # LEVEL
+    # TOTAL
     # -----------------------------------------------------
 
     draw.text(
         (
-            760,
-            70
+            790,
+            45
         ),
-        "LEVEL",
-        font=font_level_small,
+        "TOTAL LEVEL",
+        font=font_small,
         fill=(
-            225,
-            215,
-            240
+            230,
+            220,
+            245,
+            255
         )
     )
 
     draw.text(
         (
             830,
-            90
+            70
         ),
-        str(
-            level
-        ),
-        font=font_level_big,
+        str(total_level),
+        font=font_big,
         fill=(
+            255,
             255,
             255,
             255
@@ -1811,172 +2105,249 @@ def make_level_card(
     )
 
     # -----------------------------------------------------
-    # Total VC
+    # TEXT LEVEL
     # -----------------------------------------------------
 
     draw.text(
         (
-            295,
-            125
+            285,
+            145
         ),
-        "VOICE TIME",
+        f"TEXT LEVEL  {text_level}",
+        font=font_medium,
+        fill=(
+            255,
+            255,
+            255,
+            255
+        )
+    )
+
+    draw.text(
+        (
+            730,
+            151
+        ),
+        f"XP {text_xp}",
         font=font_small,
         fill=(
-            213,
-            196,
-            230
-        )
-    )
-
-    draw.text(
-        (
-            295,
-            156
-        ),
-        format_duration(
-            total_seconds
-        ),
-        font=font_normal,
-        fill=(
-            255,
-            255,
+            235,
+            225,
+            245,
             255
         )
     )
 
-    # -----------------------------------------------------
-    # Rank
-    # -----------------------------------------------------
-
-    if role_name:
-
-        draw.text(
-            (
-                295,
-                203
-            ),
-            f"RANK  {role_name}",
-            font=font_small,
-            fill=(
-                240,
-                220,
-                255
-            )
-        )
-
-    # -----------------------------------------------------
-    # XP BAR
-    # -----------------------------------------------------
-
-    bar_x = 295
-    bar_y = 260
-    bar_width = 620
-    bar_height = 28
+    # Text Bar
+    tx = 285
+    ty = 188
+    tw = 620
+    th = 20
 
     draw.rounded_rectangle(
         (
-            bar_x,
-            bar_y,
-            bar_x + bar_width,
-            bar_y + bar_height
+            tx,
+            ty,
+            tx + tw,
+            ty + th
         ),
-        radius=14,
+        radius=10,
         fill=(
-            41,
-            32,
-            58
+            20,
+            18,
+            28,
+            210
         )
     )
 
-    filled_width = int(
-        bar_width
+    text_fill = int(
+        tw
         *
-        progress
+        text_percent
     )
 
-    if filled_width > 0:
+    if text_fill > 0:
 
         draw.rounded_rectangle(
             (
-                bar_x,
-                bar_y,
-                bar_x + filled_width,
-                bar_y + bar_height
+                tx,
+                ty,
+                tx + text_fill,
+                ty + th
             ),
-            radius=14,
+            radius=10,
             fill=(
-                219,
-                170,
+                236,
+                179,
+                255,
                 255
             )
         )
 
-    current_hours = (
-        progress_seconds
-        /
-        3600
+    draw.text(
+        (
+            285,
+            214
+        ),
+        f"{text_current} / {text_needed} XP",
+        font=font_tiny,
+        fill=(
+            230,
+            225,
+            235,
+            255
+        )
     )
 
-    needed_hours = (
-        needed_seconds
-        /
-        3600
-    )
-
-    progress_text = (
-        f"{current_hours:.1f}h / "
-        f"{needed_hours:.1f}h"
-    )
+    # -----------------------------------------------------
+    # VOICE LEVEL
+    # -----------------------------------------------------
 
     draw.text(
         (
-            295,
-            303
+            285,
+            255
         ),
-        progress_text,
-        font=font_small,
+        f"VOICE LEVEL  {voice_level}",
+        font=font_medium,
         fill=(
-            225,
-            217,
-            235
+            255,
+            255,
+            255,
+            255
         )
     )
 
     draw.text(
         (
-            780,
-            303
+            690,
+            261
         ),
-        "Candy LEVEL",
+        format_duration(
+            voice_seconds
+        ),
         font=font_small,
         fill=(
+            235,
             225,
-            217,
-            235
+            245,
+            255
         )
     )
 
-    buffer = io.BytesIO()
+    vx = 285
+    vy = 298
+    vw = 620
+    vh = 20
+
+    draw.rounded_rectangle(
+        (
+            vx,
+            vy,
+            vx + vw,
+            vy + vh
+        ),
+        radius=10,
+        fill=(
+            20,
+            18,
+            28,
+            210
+        )
+    )
+
+    voice_fill = int(
+        vw
+        *
+        voice_percent
+    )
+
+    if voice_fill > 0:
+
+        draw.rounded_rectangle(
+            (
+                vx,
+                vy,
+                vx + voice_fill,
+                vy + vh
+            ),
+            radius=10,
+            fill=(
+                180,
+                194,
+                255,
+                255
+            )
+        )
+
+    draw.text(
+        (
+            285,
+            324
+        ),
+        (
+            f"{voice_current / 3600:.1f}h / "
+            f"{voice_needed / 3600:.1f}h"
+        ),
+        font=font_tiny,
+        fill=(
+            230,
+            225,
+            235,
+            255
+        )
+    )
+
+    draw.text(
+        (
+            62,
+            305
+        ),
+        "Candy",
+        font=font_medium,
+        fill=(
+            255,
+            235,
+            255,
+            255
+        )
+    )
+
+    draw.text(
+        (
+            62,
+            340
+        ),
+        "LEVEL CARD",
+        font=font_tiny,
+        fill=(
+            225,
+            210,
+            230,
+            255
+        )
+    )
+
+    output = io.BytesIO()
 
     image.save(
-        buffer,
-        format="PNG"
+        output,
+        "PNG"
     )
 
-    buffer.seek(0)
+    output.seek(0)
 
-    return buffer
+    return output
 
 
 # =========================================================
+# 一般
 # /level
-#
-# ★ 一般メンバーが使える唯一のレベルコマンド
 # =========================================================
 
 @bot.tree.command(
     name="level",
-    description="自分のCandyレベルを確認します",
+    description="自分のCandyレベルを表示します",
     guild=GUILD_OBJECT
 )
 async def level_command(
@@ -1993,33 +2364,48 @@ async def level_command(
 
     await interaction.response.defer()
 
-    total_seconds = (
-        get_live_total_seconds(
+    voice_seconds = (
+        get_live_voice_seconds(
             member.id
         )
     )
 
-    (
-        level,
-        progress_seconds,
-        needed_seconds,
-        percent,
-        next_required
-    ) = get_level_progress(
-        total_seconds
+    text_xp = db_get_text_xp(
+        member.id
     )
 
-    # -----------------------------------------------------
-    # 現在のランクロール
-    # -----------------------------------------------------
+    (
+        voice_level,
+        voice_current,
+        voice_needed,
+        voice_percent
+    ) = voice_progress(
+        voice_seconds
+    )
 
-    target_role_id = (
-        get_target_level_role_id(
-            level
+    (
+        text_level,
+        text_current,
+        text_needed,
+        text_percent
+    ) = text_progress(
+        text_xp
+    )
+
+    total_level = (
+        calculate_total_level(
+            voice_level,
+            text_level
         )
     )
 
     role_name = ""
+
+    target_role_id = (
+        get_target_level_role_id(
+            total_level
+        )
+    )
 
     if target_role_id:
 
@@ -2031,36 +2417,41 @@ async def level_command(
 
             role_name = role.name
 
-    # -----------------------------------------------------
-    # サーバーアバター優先
-    # -----------------------------------------------------
-
-    avatar_asset = (
+    avatar = (
         member.guild_avatar
         or
         member.display_avatar
     )
 
-    try:
+    avatar_bytes = (
+        await avatar.read()
+    )
 
-        avatar_bytes = await avatar_asset.read()
-
-    except Exception:
-
-        avatar_bytes = (
-            await member.display_avatar.read()
+    background_path = (
+        str(
+            get_background_path(
+                member.id
+            )
         )
+    )
 
     card = await asyncio.to_thread(
         make_level_card,
         avatar_bytes,
         member.display_name,
-        level,
-        total_seconds,
-        percent,
-        progress_seconds,
-        needed_seconds,
-        role_name
+        total_level,
+        voice_level,
+        text_level,
+        voice_seconds,
+        text_xp,
+        voice_percent,
+        voice_current,
+        voice_needed,
+        text_percent,
+        text_current,
+        text_needed,
+        role_name,
+        background_path
     )
 
     file = discord.File(
@@ -2068,44 +2459,148 @@ async def level_command(
         filename="candy_level.png"
     )
 
-    embed = discord.Embed(
-        description=(
-            f"🍬 **{member.display_name}**\n"
-            f"現在 **Lv.{level}**\n"
-            f"累計VC **{format_duration(total_seconds)}**"
-        )
-    )
-
-    embed.set_image(
-        url="attachment://candy_level.png"
-    )
-
     await interaction.followup.send(
-        embed=embed,
         file=file
     )
 
 
 # =========================================================
+# 一般
+# /level_background
+# =========================================================
+
+@bot.tree.command(
+    name="level_background",
+    description="自分のレベルカード背景を変更します",
+    guild=GUILD_OBJECT
+)
+@app_commands.describe(
+    image="背景にしたい画像"
+)
+async def level_background(
+    interaction: discord.Interaction,
+    image: discord.Attachment
+):
+
+    member = interaction.user
+
+    if not isinstance(
+        member,
+        discord.Member
+    ):
+        return
+
+    if image.size > 8 * 1024 * 1024:
+
+        await interaction.response.send_message(
+            "❌ 画像は8MB以下にしてください。",
+            ephemeral=True
+        )
+
+        return
+
+    content_type = (
+        image.content_type
+        or
+        ""
+    )
+
+    if not content_type.startswith(
+        "image/"
+    ):
+
+        await interaction.response.send_message(
+            "❌ 画像ファイルを選択してください。",
+            ephemeral=True
+        )
+
+        return
+
+    await interaction.response.defer(
+        ephemeral=True
+    )
+
+    try:
+
+        data = await image.read()
+
+        await asyncio.to_thread(
+            save_background_image,
+            member.id,
+            data
+        )
+
+        await interaction.followup.send(
+            (
+                "✅ レベルカードの背景を変更しました！🍬\n"
+                "次に `/level` を使うと反映されます。"
+            ),
+            ephemeral=True
+        )
+
+    except Exception:
+
+        log.exception(
+            "背景画像保存失敗"
+        )
+
+        await interaction.followup.send(
+            "❌ 画像の保存に失敗しました。",
+            ephemeral=True
+        )
+
+
+# =========================================================
+# 一般
+# /level_background_reset
+# =========================================================
+
+@bot.tree.command(
+    name="level_background_reset",
+    description="レベルカードの背景を初期状態に戻します",
+    guild=GUILD_OBJECT
+)
+async def level_background_reset(
+    interaction: discord.Interaction
+):
+
+    path = get_background_path(
+        interaction.user.id
+    )
+
+    try:
+
+        if path.exists():
+            path.unlink()
+
+    except Exception:
+
+        log.exception(
+            "背景削除失敗"
+        )
+
+    await interaction.response.send_message(
+        "✅ レベルカード背景をCandy標準に戻しました。",
+        ephemeral=True
+    )
+
+
+# =========================================================
 # 管理者
-# /levelrole_set
+# レベルロール設定
 # =========================================================
 
 @bot.tree.command(
     name="levelrole_set",
-    description="指定レベルから付与するランクロールを設定",
+    description="Total Levelに応じたロールを設定",
     guild=GUILD_OBJECT
 )
 @app_commands.default_permissions(
     manage_guild=True
 )
-@app_commands.describe(
-    level="このロールになる開始レベル",
-    role="付与するロール"
-)
 async def levelrole_set(
     interaction: discord.Interaction,
-    level: app_commands.Range[int, 1, 1000],
+    level: app_commands.Range[int, 1, 2000],
     role: discord.Role
 ):
 
@@ -2130,25 +2625,13 @@ async def levelrole_set(
 
     await interaction.response.send_message(
         (
-            f"✅ **Lv.{level}** から\n"
+            f"✅ **Total Lv.{level}** から\n"
             f"{role.mention}\n"
-            "になるように設定しました。\n\n"
-            "以前のレベルロールは自動で外れます。"
+            "になるよう設定しました。"
         ),
         ephemeral=True
     )
 
-    asyncio.create_task(
-        sync_all_level_roles(
-            interaction.guild
-        )
-    )
-
-
-# =========================================================
-# 管理者
-# /levelrole_remove
-# =========================================================
 
 @bot.tree.command(
     name="levelrole_remove",
@@ -2160,7 +2643,7 @@ async def levelrole_set(
 )
 async def levelrole_remove(
     interaction: discord.Interaction,
-    level: app_commands.Range[int, 1, 1000]
+    level: app_commands.Range[int, 1, 2000]
 ):
 
     if not await require_admin(
@@ -2173,25 +2656,14 @@ async def levelrole_remove(
     )
 
     await interaction.response.send_message(
-        f"✅ Lv.{level} のロール設定を削除しました。",
+        f"✅ Total Lv.{level} の設定を削除しました。",
         ephemeral=True
     )
 
-    asyncio.create_task(
-        sync_all_level_roles(
-            interaction.guild
-        )
-    )
-
-
-# =========================================================
-# 管理者
-# /levelrole_list
-# =========================================================
 
 @bot.tree.command(
     name="levelrole_list",
-    description="設定中のレベルロールを見る",
+    description="レベルロール設定を確認",
     guild=GUILD_OBJECT
 )
 @app_commands.default_permissions(
@@ -2211,7 +2683,7 @@ async def levelrole_list(
     if not rows:
 
         await interaction.response.send_message(
-            "現在レベルロールは設定されていません。",
+            "レベルロールはまだ設定されていません。",
             ephemeral=True
         )
 
@@ -2221,34 +2693,24 @@ async def levelrole_list(
 
     for row in rows:
 
-        level = int(
-            row["level"]
-        )
-
-        role_id = int(
-            row["role_id"]
-        )
-
         role = interaction.guild.get_role(
-            role_id
+            int(
+                row["role_id"]
+            )
         )
 
-        if role:
-
-            role_text = role.mention
-
-        else:
-
-            role_text = (
-                f"削除済みロール ({role_id})"
-            )
+        role_text = (
+            role.mention
+            if role
+            else "削除済みロール"
+        )
 
         lines.append(
-            f"**Lv.{level}** → {role_text}"
+            f"**Total Lv.{row['level']}** → {role_text}"
         )
 
     await interaction.response.send_message(
-        "🍬 **Candy レベルロール設定**\n\n"
+        "🍬 **Candy Level Role**\n\n"
         +
         "\n".join(
             lines
@@ -2259,84 +2721,21 @@ async def levelrole_list(
 
 # =========================================================
 # 管理者
-# /level_set
+# VOICE時間操作
 # =========================================================
 
 @bot.tree.command(
-    name="level_set",
-    description="メンバーのレベルを指定レベルに変更",
-    guild=GUILD_OBJECT
-)
-@app_commands.default_permissions(
-    manage_guild=True
-)
-async def level_set(
-    interaction: discord.Interaction,
-    member: discord.Member,
-    level: app_commands.Range[int, 1, 1000]
-):
-
-    if not await require_admin(
-        interaction
-    ):
-        return
-
-    await flush_voice_session(
-        member.id,
-        keep_running=(
-            member.voice is not None
-            and
-            member.voice.channel is not None
-            and
-            is_countable_voice_channel(
-                member.guild,
-                member.voice.channel
-            )
-        )
-    )
-
-    seconds = (
-        required_seconds_for_level(
-            level
-        )
-    )
-
-    db_set_seconds(
-        member.id,
-        seconds
-    )
-
-    await sync_level_roles(
-        member
-    )
-
-    await interaction.response.send_message(
-        (
-            f"✅ {member.mention} を "
-            f"**Lv.{level}** に設定しました。\n"
-            f"VC時間：**{format_duration(seconds)}**"
-        ),
-        ephemeral=True
-    )
-
-
-# =========================================================
-# 管理者
-# /leveltime_add
-# =========================================================
-
-@bot.tree.command(
-    name="leveltime_add",
+    name="voice_add",
     description="メンバーのVC時間を追加",
     guild=GUILD_OBJECT
 )
 @app_commands.default_permissions(
     manage_guild=True
 )
-async def leveltime_add(
+async def voice_add(
     interaction: discord.Interaction,
     member: discord.Member,
-    hours: app_commands.Range[float, 0.1, 10000.0]
+    hours: app_commands.Range[float, 0.1, 10000]
 ):
 
     if not await require_admin(
@@ -2346,19 +2745,12 @@ async def leveltime_add(
 
     await flush_voice_session(
         member.id,
-        keep_running=(
-            member.voice is not None
-            and
-            member.voice.channel is not None
-            and
-            is_countable_voice_channel(
-                member.guild,
-                member.voice.channel
-            )
-        )
+        member.voice is not None
+        and
+        member.voice.channel is not None
     )
 
-    db_add_seconds(
+    db_add_voice_seconds(
         member.id,
         hours * 3600
     )
@@ -2367,42 +2759,24 @@ async def leveltime_add(
         member
     )
 
-    total = get_live_total_seconds(
-        member.id
-    )
-
-    level = calculate_level(
-        total
-    )
-
     await interaction.response.send_message(
-        (
-            f"✅ {member.mention} に "
-            f"**{hours:g}時間** 追加しました。\n\n"
-            f"現在：**Lv.{level}**\n"
-            f"累計：**{format_duration(total)}**"
-        ),
+        f"✅ {member.mention} にVC **{hours:g}時間**追加しました。",
         ephemeral=True
     )
 
 
-# =========================================================
-# 管理者
-# /leveltime_remove
-# =========================================================
-
 @bot.tree.command(
-    name="leveltime_remove",
+    name="voice_remove",
     description="メンバーのVC時間を減らす",
     guild=GUILD_OBJECT
 )
 @app_commands.default_permissions(
     manage_guild=True
 )
-async def leveltime_remove(
+async def voice_remove(
     interaction: discord.Interaction,
     member: discord.Member,
-    hours: app_commands.Range[float, 0.1, 10000.0]
+    hours: app_commands.Range[float, 0.1, 10000]
 ):
 
     if not await require_admin(
@@ -2412,52 +2786,156 @@ async def leveltime_remove(
 
     await flush_voice_session(
         member.id,
-        keep_running=(
-            member.voice is not None
-            and
-            member.voice.channel is not None
-            and
-            is_countable_voice_channel(
-                member.guild,
-                member.voice.channel
-            )
-        )
+        member.voice is not None
+        and
+        member.voice.channel is not None
     )
 
-    current = db_get_seconds(
+    current = db_get_voice_seconds(
         member.id
     )
 
-    new_seconds = max(
-        0,
-        current
-        -
-        (
-            hours
-            *
-            3600
-        )
-    )
-
-    db_set_seconds(
+    db_set_voice_seconds(
         member.id,
-        new_seconds
+        max(
+            0,
+            current
+            -
+            hours * 3600
+        )
     )
 
     await sync_level_roles(
         member
     )
 
-    level = calculate_level(
-        new_seconds
+    await interaction.response.send_message(
+        f"✅ {member.mention} のVC時間を **{hours:g}時間**減らしました。",
+        ephemeral=True
+    )
+
+
+# =========================================================
+# 管理者
+# TEXT XP
+# =========================================================
+
+@bot.tree.command(
+    name="textxp_add",
+    description="メンバーのText XPを追加",
+    guild=GUILD_OBJECT
+)
+@app_commands.default_permissions(
+    manage_guild=True
+)
+async def textxp_add(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    xp: app_commands.Range[int, 1, 1000000]
+):
+
+    if not await require_admin(
+        interaction
+    ):
+        return
+
+    db_add_text_xp(
+        member.id,
+        xp
+    )
+
+    await sync_level_roles(
+        member
+    )
+
+    await interaction.response.send_message(
+        f"✅ {member.mention} に **{xp} Text XP**追加しました。",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(
+    name="textxp_remove",
+    description="メンバーのText XPを減らす",
+    guild=GUILD_OBJECT
+)
+@app_commands.default_permissions(
+    manage_guild=True
+)
+async def textxp_remove(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    xp: app_commands.Range[int, 1, 1000000]
+):
+
+    if not await require_admin(
+        interaction
+    ):
+        return
+
+    current = db_get_text_xp(
+        member.id
+    )
+
+    db_set_text_xp(
+        member.id,
+        max(
+            0,
+            current - xp
+        )
+    )
+
+    await sync_level_roles(
+        member
+    )
+
+    await interaction.response.send_message(
+        f"✅ {member.mention} から **{xp} Text XP**減らしました。",
+        ephemeral=True
+    )
+
+
+# =========================================================
+# 管理者
+# LEVEL INFO
+# =========================================================
+
+@bot.tree.command(
+    name="levelinfo",
+    description="メンバーのレベル詳細を見る",
+    guild=GUILD_OBJECT
+)
+@app_commands.default_permissions(
+    manage_guild=True
+)
+async def levelinfo(
+    interaction: discord.Interaction,
+    member: discord.Member
+):
+
+    if not await require_admin(
+        interaction
+    ):
+        return
+
+    (
+        voice_seconds,
+        text_xp,
+        voice_level,
+        text_level,
+        total_level
+    ) = get_member_levels(
+        member.id
     )
 
     await interaction.response.send_message(
         (
-            f"✅ {member.mention} から "
-            f"**{hours:g}時間** 減らしました。\n\n"
-            f"現在：**Lv.{level}**\n"
-            f"累計：**{format_duration(new_seconds)}**"
+            f"🍬 **{member.display_name}**\n\n"
+            f"⭐ Total Level：**{total_level}**\n"
+            f"🎤 Voice Level：**{voice_level}**\n"
+            f"🎤 VC累計：**{format_duration(voice_seconds)}**\n"
+            f"💬 Text Level：**{text_level}**\n"
+            f"💬 Text XP：**{text_xp}**"
         ),
         ephemeral=True
     )
@@ -2465,12 +2943,12 @@ async def leveltime_remove(
 
 # =========================================================
 # 管理者
-# /level_reset
+# RESET
 # =========================================================
 
 @bot.tree.command(
     name="level_reset",
-    description="メンバーのレベルとVC時間をリセット",
+    description="メンバーのVoice/Textレベルを完全リセット",
     guild=GUILD_OBJECT
 )
 @app_commands.default_permissions(
@@ -2488,10 +2966,15 @@ async def level_reset(
 
     await flush_voice_session(
         member.id,
-        keep_running=False
+        False
     )
 
-    db_set_seconds(
+    db_set_voice_seconds(
+        member.id,
+        0
+    )
+
+    db_set_text_xp(
         member.id,
         0
     )
@@ -2516,78 +2999,20 @@ async def level_reset(
     )
 
     await interaction.response.send_message(
-        (
-            f"✅ {member.mention} のレベルを"
-            "**Lv.1** にリセットしました。"
-        ),
+        f"✅ {member.mention} のレベル情報をリセットしました。",
         ephemeral=True
     )
 
 
 # =========================================================
-# 管理者
-# /levelinfo
-# =========================================================
-
-@bot.tree.command(
-    name="levelinfo",
-    description="メンバーの詳しいレベル情報を見る",
-    guild=GUILD_OBJECT
-)
-@app_commands.default_permissions(
-    manage_guild=True
-)
-async def levelinfo(
-    interaction: discord.Interaction,
-    member: discord.Member
-):
-
-    if not await require_admin(
-        interaction
-    ):
-        return
-
-    total = get_live_total_seconds(
-        member.id
-    )
-
-    level = calculate_level(
-        total
-    )
-
-    next_seconds = (
-        required_seconds_for_level(
-            level + 1
-        )
-    )
-
-    remaining = max(
-        0,
-        next_seconds
-        -
-        total
-    )
-
-    await interaction.response.send_message(
-        (
-            f"🍬 **{member.display_name}**\n\n"
-            f"レベル：**Lv.{level}**\n"
-            f"累計VC：**{format_duration(total)}**\n"
-            f"次のレベルまで：**{format_duration(remaining)}**"
-        ),
-        ephemeral=True
-    )
-
-
-# =========================================================
-# VC変化
+# VC STATE
 # =========================================================
 
 @bot.event
 async def on_voice_state_update(
-    member: discord.Member,
-    before: discord.VoiceState,
-    after: discord.VoiceState
+    member,
+    before,
+    after
 ):
 
     if member.bot:
@@ -2597,13 +3022,6 @@ async def on_voice_state_update(
         return
 
     guild = member.guild
-
-    # -----------------------------------------------------
-    # LEVEL TRACKER
-    #
-    # ミュート状態は完全無視
-    # VCにいるだけで加算
-    # -----------------------------------------------------
 
     before_countable = (
         is_countable_voice_channel(
@@ -2619,7 +3037,7 @@ async def on_voice_state_update(
         )
     )
 
-    # 普通のVCへ入った
+    # VC入室
     if (
         not before_countable
         and
@@ -2630,7 +3048,7 @@ async def on_voice_state_update(
             member
         )
 
-    # 普通のVCから退出 / AFK移動
+    # VC退出 / AFK
     elif (
         before_countable
         and
@@ -2639,39 +3057,17 @@ async def on_voice_state_update(
 
         await flush_voice_session(
             member.id,
-            keep_running=False
+            False
         )
 
         await sync_level_roles(
             member
         )
 
-    # -----------------------------------------------------
-    # ミュート等の変化だけなら
-    # プロフィール処理はしない
-    # -----------------------------------------------------
-
+    # ミュート変化だけなら
+    # プロフィールは何もしない
     if before.channel == after.channel:
         return
-
-    log.info(
-        "VC変化: %s | %s -> %s",
-        member,
-        (
-            before.channel.name
-            if before.channel
-            else "NONE"
-        ),
-        (
-            after.channel.name
-            if after.channel
-            else "NONE"
-        )
-    )
-
-    # -----------------------------------------------------
-    # 古いプロフィール予約キャンセル
-    # -----------------------------------------------------
 
     old_task = profile_tasks.pop(
         member.id,
@@ -2684,14 +3080,8 @@ async def on_voice_state_update(
 
         try:
             await old_task
-        except asyncio.CancelledError:
-            pass
         except Exception:
             pass
-
-    # -----------------------------------------------------
-    # 元VCプロフィール削除
-    # -----------------------------------------------------
 
     if before.channel:
 
@@ -2704,22 +3094,8 @@ async def on_voice_state_update(
         member
     )
 
-    # -----------------------------------------------------
-    # 完全退出
-    # -----------------------------------------------------
-
     if after.channel is None:
-
-        log.info(
-            "✅ VC退出: %s",
-            member
-        )
-
         return
-
-    # -----------------------------------------------------
-    # 新VCプロフィール予約
-    # -----------------------------------------------------
 
     task = asyncio.create_task(
         delayed_profile_post(
@@ -2734,12 +3110,14 @@ async def on_voice_state_update(
 
 
 # =========================================================
-# プロフィール投稿キャッシュ
+# MESSAGE
+#
+# プロフィールキャッシュ + Text XP
 # =========================================================
 
 @bot.event
 async def on_message(
-    message: discord.Message
+    message
 ):
 
     if message.author.bot:
@@ -2751,6 +3129,10 @@ async def on_message(
     if message.guild.id != GUILD_ID:
         return
 
+    # -----------------------------------------------------
+    # プロフィール
+    # -----------------------------------------------------
+
     if message.channel.id in {
         MALE_PROFILE_CHANNEL_ID,
         FEMALE_PROFILE_CHANNEL_ID
@@ -2760,10 +3142,67 @@ async def on_message(
             message.author.id
         ] = message
 
-        log.info(
-            "✅ プロフィールキャッシュ更新: %s",
-            message.author
+    # -----------------------------------------------------
+    # Text XP
+    # -----------------------------------------------------
+
+    # スラッシュコマンド等は対象外
+    content = (
+        message.content
+        or
+        ""
+    ).strip()
+
+    # 3文字以上
+    if (
+        len(content)
+        >=
+        TEXT_MIN_LENGTH
+    ):
+
+        user_id = (
+            message.author.id
         )
+
+        now = time.time()
+
+        last = (
+            text_xp_cooldowns.get(
+                user_id,
+                0
+            )
+        )
+
+        # 60秒クールタイム
+        if (
+            now
+            -
+            last
+            >=
+            TEXT_XP_COOLDOWN
+        ):
+
+            db_add_text_xp(
+                user_id,
+                TEXT_XP_PER_MESSAGE
+            )
+
+            text_xp_cooldowns[
+                user_id
+            ] = now
+
+            # レベルロールも確認
+            try:
+
+                await sync_level_roles(
+                    message.author
+                )
+
+            except Exception:
+
+                log.exception(
+                    "Text XPロール同期失敗"
+                )
 
     await bot.process_commands(
         message
@@ -2771,12 +3210,12 @@ async def on_message(
 
 
 # =========================================================
-# プロフィール削除
+# プロフィール削除キャッシュ
 # =========================================================
 
 @bot.event
 async def on_raw_message_delete(
-    payload: discord.RawMessageDeleteEvent
+    payload
 ):
 
     if payload.guild_id != GUILD_ID:
@@ -2788,21 +3227,17 @@ async def on_raw_message_delete(
     }:
         return
 
-    remove_users = []
+    remove = []
 
     for user_id, message in profile_cache.items():
 
-        if (
-            message.id
-            ==
-            payload.message_id
-        ):
+        if message.id == payload.message_id:
 
-            remove_users.append(
+            remove.append(
                 user_id
             )
 
-    for user_id in remove_users:
+    for user_id in remove:
 
         profile_cache.pop(
             user_id,
@@ -2816,7 +3251,7 @@ async def on_raw_message_delete(
 
 @bot.event
 async def on_member_join(
-    member: discord.Member
+    member
 ):
 
     if member.guild.id != GUILD_ID:
@@ -2825,8 +3260,6 @@ async def on_member_join(
     if member.bot:
         return
 
-    # Lv1ロールが設定されていれば
-    # Candy新人などを自動付与
     await sync_level_roles(
         member
     )
@@ -2851,15 +3284,12 @@ async def on_ready():
     if guild is None:
 
         log.error(
-            "Candyサーバーが見つかりません。"
+            "Candyサーバーが見つかりません"
         )
 
         return
 
-    # -----------------------------------------------------
-    # Slash Command同期
-    # -----------------------------------------------------
-
+    # Slash同期
     if not synced_once:
 
         try:
@@ -2869,7 +3299,7 @@ async def on_ready():
             )
 
             log.info(
-                "✅ Slash Command同期: %s個",
+                "✅ Slash同期: %s個",
                 len(synced)
             )
 
@@ -2878,16 +3308,12 @@ async def on_ready():
         except Exception:
 
             log.exception(
-                "Slash Command同期エラー"
+                "Slash同期失敗"
             )
 
-    # -----------------------------------------------------
-    # Bot起動時すでにVCにいる人
-    # -----------------------------------------------------
-
+    # 起動時すでにVCにいる人
     for channel in guild.voice_channels:
 
-        # AFKは除外
         if not is_countable_voice_channel(
             guild,
             channel
@@ -2899,40 +3325,20 @@ async def on_ready():
             if member.bot:
                 continue
 
-            if (
-                member.id
-                not in
-                voice_sessions
-            ):
+            start_voice_session(
+                member
+            )
 
-                start_voice_session(
-                    member
-                )
+    if not voice_save_loop.is_running():
 
-    # -----------------------------------------------------
-    # 1分保存ループ
-    # -----------------------------------------------------
-
-    if not level_flush_loop.is_running():
-
-        level_flush_loop.start()
+        voice_save_loop.start()
 
     log.info(
         "================================"
     )
 
     log.info(
-        "🍬 Candy Bot 起動成功"
-    )
-
-    log.info(
-        "Bot: %s",
-        bot.user
-    )
-
-    log.info(
-        "Server ID: %s",
-        GUILD_ID
+        "🍬 Candy Level Bot 起動成功"
     )
 
     log.info(
@@ -2940,27 +3346,40 @@ async def on_ready():
     )
 
     log.info(
-        "🎤 VCレベル: ON"
+        "🎤 Voice Level: ON"
     )
 
     log.info(
-        "🔇 ミュート中: 加算"
+        "💬 Text Level: ON"
     )
 
     log.info(
-        "👤 1人VC: 加算"
+        "⭐ Total Level: Voice + Text"
     )
 
     log.info(
-        "💤 AFK VC: 加算しない"
+        "🎤 Voice Lv5 = 10時間"
     )
 
     log.info(
-        "⏱️ Lv5到達: 累計10時間"
+        "👤 1人VC = 加算"
     )
 
     log.info(
-        "🍬 自動レベルロール: ON"
+        "🔇 ミュート = 加算"
+    )
+
+    log.info(
+        "💤 AFK = 加算なし"
+    )
+
+    log.info(
+        "💬 Text XP cooldown = %s秒",
+        TEXT_XP_COOLDOWN
+    )
+
+    log.info(
+        "🖼️ 個人背景 = ON"
     )
 
     log.info(
