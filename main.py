@@ -13,7 +13,7 @@ from threading import Thread
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageEnhance, ImageFont
 
 
 # =========================================================
@@ -42,13 +42,8 @@ DUPLICATE_CHECK_LIMIT = 20
 # Text XP
 # =========================================================
 
-# 同一人物がXPを獲得できる間隔
 TEXT_XP_COOLDOWN = 60
-
-# これ未満の文字数はXPなし
 TEXT_MIN_LENGTH = 3
-
-# 1投稿のXP
 TEXT_XP_PER_MESSAGE = 1
 
 
@@ -125,10 +120,6 @@ def init_database():
 
     with db_connect() as conn:
 
-        # -----------------------------------------
-        # VC累計
-        # -----------------------------------------
-
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS voice_stats (
@@ -138,10 +129,6 @@ def init_database():
             """
         )
 
-        # -----------------------------------------
-        # TC XP
-        # -----------------------------------------
-
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS text_stats (
@@ -150,10 +137,6 @@ def init_database():
             )
             """
         )
-
-        # -----------------------------------------
-        # レベルロール
-        # -----------------------------------------
 
         conn.execute(
             """
@@ -422,8 +405,6 @@ def db_get_level_roles():
 
 # =========================================================
 # VOICE LEVEL
-#
-# Lv5 = 累計10時間
 # =========================================================
 
 def voice_required_hours(
@@ -541,11 +522,6 @@ def voice_progress(
 
 # =========================================================
 # TEXT LEVEL
-#
-# Lv5 = 300有効メッセージ相当
-#
-# 60秒クールタイムなので
-# 連投だけで一気に上げにくい設定
 # =========================================================
 
 def text_required_xp(
@@ -778,7 +754,6 @@ profile_cache = {}
 
 voice_sessions = {}
 
-# TEXT XPクールタイム
 text_xp_cooldowns = {}
 
 
@@ -841,7 +816,6 @@ def is_countable_voice_channel(
     if channel is None:
         return False
 
-    # AFKチャンネル除外
     if (
         guild.afk_channel
         and
@@ -1876,10 +1850,6 @@ def make_level_card(
     width = 1000
     height = 420
 
-    # -----------------------------------------------------
-    # Background
-    # -----------------------------------------------------
-
     if (
         background_path
         and
@@ -1919,7 +1889,6 @@ def make_level_card(
             height
         )
 
-    # 暗くして文字を読みやすく
     enhancer = ImageEnhance.Brightness(
         image
     )
@@ -1933,7 +1902,6 @@ def make_level_card(
         "RGBA"
     )
 
-    # カード半透明
     draw.rounded_rectangle(
         (
             25,
@@ -1949,10 +1917,6 @@ def make_level_card(
             125
         )
     )
-
-    # -----------------------------------------------------
-    # Avatar
-    # -----------------------------------------------------
 
     try:
 
@@ -2034,10 +1998,6 @@ def make_level_card(
     font_small = get_font(18)
     font_tiny = get_font(15)
 
-    # -----------------------------------------------------
-    # User
-    # -----------------------------------------------------
-
     draw.text(
         (
             285,
@@ -2070,10 +2030,6 @@ def make_level_card(
             )
         )
 
-    # -----------------------------------------------------
-    # TOTAL
-    # -----------------------------------------------------
-
     draw.text(
         (
             790,
@@ -2103,10 +2059,6 @@ def make_level_card(
             255
         )
     )
-
-    # -----------------------------------------------------
-    # TEXT LEVEL
-    # -----------------------------------------------------
 
     draw.text(
         (
@@ -2138,7 +2090,6 @@ def make_level_card(
         )
     )
 
-    # Text Bar
     tx = 285
     ty = 188
     tw = 620
@@ -2198,10 +2149,6 @@ def make_level_card(
             255
         )
     )
-
-    # -----------------------------------------------------
-    # VOICE LEVEL
-    # -----------------------------------------------------
 
     draw.text(
         (
@@ -2735,7 +2682,7 @@ async def levelrole_list(
 async def voice_add(
     interaction: discord.Interaction,
     member: discord.Member,
-    hours: app_commands.Range[float, 0.1, 10000]
+    hours: app_commands.Range[float, 0.1, 10000.0]
 ):
 
     if not await require_admin(
@@ -2745,9 +2692,16 @@ async def voice_add(
 
     await flush_voice_session(
         member.id,
-        member.voice is not None
-        and
-        member.voice.channel is not None
+        (
+            member.voice is not None
+            and
+            member.voice.channel is not None
+            and
+            is_countable_voice_channel(
+                member.guild,
+                member.voice.channel
+            )
+        )
     )
 
     db_add_voice_seconds(
@@ -2776,7 +2730,7 @@ async def voice_add(
 async def voice_remove(
     interaction: discord.Interaction,
     member: discord.Member,
-    hours: app_commands.Range[float, 0.1, 10000]
+    hours: app_commands.Range[float, 0.1, 10000.0]
 ):
 
     if not await require_admin(
@@ -2786,9 +2740,16 @@ async def voice_remove(
 
     await flush_voice_session(
         member.id,
-        member.voice is not None
-        and
-        member.voice.channel is not None
+        (
+            member.voice is not None
+            and
+            member.voice.channel is not None
+            and
+            is_countable_voice_channel(
+                member.guild,
+                member.voice.channel
+            )
+        )
     )
 
     current = db_get_voice_seconds(
@@ -3037,7 +2998,6 @@ async def on_voice_state_update(
         )
     )
 
-    # VC入室
     if (
         not before_countable
         and
@@ -3048,7 +3008,6 @@ async def on_voice_state_update(
             member
         )
 
-    # VC退出 / AFK
     elif (
         before_countable
         and
@@ -3064,8 +3023,6 @@ async def on_voice_state_update(
             member
         )
 
-    # ミュート変化だけなら
-    # プロフィールは何もしない
     if before.channel == after.channel:
         return
 
@@ -3080,6 +3037,8 @@ async def on_voice_state_update(
 
         try:
             await old_task
+        except asyncio.CancelledError:
+            pass
         except Exception:
             pass
 
@@ -3111,8 +3070,6 @@ async def on_voice_state_update(
 
 # =========================================================
 # MESSAGE
-#
-# プロフィールキャッシュ + Text XP
 # =========================================================
 
 @bot.event
@@ -3129,10 +3086,6 @@ async def on_message(
     if message.guild.id != GUILD_ID:
         return
 
-    # -----------------------------------------------------
-    # プロフィール
-    # -----------------------------------------------------
-
     if message.channel.id in {
         MALE_PROFILE_CHANNEL_ID,
         FEMALE_PROFILE_CHANNEL_ID
@@ -3142,18 +3095,12 @@ async def on_message(
             message.author.id
         ] = message
 
-    # -----------------------------------------------------
-    # Text XP
-    # -----------------------------------------------------
-
-    # スラッシュコマンド等は対象外
     content = (
         message.content
         or
         ""
     ).strip()
 
-    # 3文字以上
     if (
         len(content)
         >=
@@ -3173,7 +3120,6 @@ async def on_message(
             )
         )
 
-        # 60秒クールタイム
         if (
             now
             -
@@ -3191,7 +3137,6 @@ async def on_message(
                 user_id
             ] = now
 
-            # レベルロールも確認
             try:
 
                 await sync_level_roles(
@@ -3289,7 +3234,6 @@ async def on_ready():
 
         return
 
-    # Slash同期
     if not synced_once:
 
         try:
@@ -3311,7 +3255,6 @@ async def on_ready():
                 "Slash同期失敗"
             )
 
-    # 起動時すでにVCにいる人
     for channel in guild.voice_channels:
 
         if not is_countable_voice_channel(
